@@ -12,9 +12,13 @@ WORKDIR /app
 FROM base AS build-deps
 RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ && rm -rf /var/lib/apt/lists/*
 COPY package.json package-lock.json ./
-RUN npm ci
+RUN npm ci --include=dev
 
 FROM base AS builder
+ARG DATABASE_URL=postgresql://build:build@localhost:5432/build
+ARG BETTER_AUTH_SECRET=build-only-secret-12345678901234
+ENV DATABASE_URL=$DATABASE_URL \
+    BETTER_AUTH_SECRET=$BETTER_AUTH_SECRET
 COPY --from=build-deps /app/node_modules ./node_modules
 COPY . .
 RUN npm run build

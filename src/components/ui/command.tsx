@@ -24,9 +24,11 @@ function Command({
   return (
     <CommandPrimitive
       data-slot="command"
+      // The dialog content renders through a portal to <body>; this root is
+      // only a mount point, so keep it out of the document flow entirely.
       className={cn(
         "flex size-full flex-col overflow-hidden rounded-xl! bg-popover p-1 text-popover-foreground",
-        className
+        "hidden"
       )}
       {...props}
     />

@@ -19,11 +19,11 @@ export async function GET(request: Request, context: { params: Promise<{ idOrSlu
       pageSize: z.coerce.number().int().min(1).max(200).default(50),
     });
     const parsed = schema.parse({
-      path: searchParams.get("path"),
-      status: searchParams.get("status"),
-      language: searchParams.get("language"),
-      page: searchParams.get("page"),
-      pageSize: searchParams.get("pageSize"),
+      path: searchParams.get("path") ?? undefined,
+      status: searchParams.get("status") ?? undefined,
+      language: searchParams.get("language") ?? undefined,
+      page: searchParams.get("page") ?? undefined,
+      pageSize: searchParams.get("pageSize") ?? undefined,
     });
     const where = {
       projectId: project.id,

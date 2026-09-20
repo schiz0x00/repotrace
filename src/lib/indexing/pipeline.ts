@@ -352,9 +352,15 @@ async function processFile(args: ProcessFileArgs): Promise<FileOutcome> {
   await db.chunk.deleteMany({ where: { fileId: file.id } });
   await db.symbol.deleteMany({ where: { fileId: file.id } });
 
-  // Insert symbols with structural metadata.
+  // Insert symbols with structural metadata. File-level imports/calls are
+  // inherited by top-level symbols so dependency lookups return the module's
+  // imports regardless of which symbol is queried.
   const symbolIdByQualified = new Map<string, string>();
+  const fileSymbol = parsed.symbols.find((s) => s.kind === "module");
+  const fileImports = fileSymbol?.imports ?? [];
+  const fileCalls = fileSymbol?.calls ?? [];
   for (const sym of parsed.symbols) {
+    const isTopLevel = sym.parentName === null;
     const created = await db.symbol.create({
       data: {
         projectId,
@@ -367,8 +373,8 @@ async function processFile(args: ProcessFileArgs): Promise<FileOutcome> {
         endLine: sym.endLine,
         parentName: sym.parentName,
         metadata: {
-          calls: dedupe(sym.calls),
-          imports: dedupe(sym.imports),
+          calls: dedupe(isTopLevel ? [...sym.calls, ...fileCalls] : sym.calls),
+          imports: dedupe(isTopLevel ? [...sym.imports, ...fileImports] : sym.imports),
           extends: dedupe(sym.extends),
         },
       },
@@ -540,8 +546,9 @@ export async function syncRepository(
   } else {
     await fetchBranch(workspace, url, branch, creds);
     if (await cancelled()) throw new CancelledError();
-    const head = await currentHead(workspace);
-    await checkoutCommit(workspace, head);
+    // `git fetch` only moves origin/<branch>; the local branch is stale, so
+    // check the fetched ref out or new remote commits are never seen.
+    await checkoutCommit(workspace, `origin/${branch}`);
   }
   return workspace;
 }

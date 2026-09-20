@@ -13,8 +13,13 @@ export function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;
   const sessionCookie = getSessionCookie(request);
 
-  if (pathname === "/login" || pathname === "/signup") {
-    if (sessionCookie) {
+  if (
+    pathname === "/login" ||
+    pathname === "/signup" ||
+    pathname === "/forgot-password" ||
+    pathname === "/reset-password"
+  ) {
+    if (sessionCookie && pathname !== "/forgot-password" && pathname !== "/reset-password") {
       return NextResponse.redirect(new URL("/", request.url));
     }
     return NextResponse.next();

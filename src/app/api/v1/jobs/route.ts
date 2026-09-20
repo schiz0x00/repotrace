@@ -17,10 +17,10 @@ export async function GET(request: Request) {
       limit: z.coerce.number().int().min(1).max(200).default(50),
     });
     const parsed = schema.parse({
-      project: searchParams.get("project"),
-      status: searchParams.get("status"),
-      type: searchParams.get("type"),
-      limit: searchParams.get("limit"),
+      project: searchParams.get("project") ?? undefined,
+      status: searchParams.get("status") ?? undefined,
+      type: searchParams.get("type") ?? undefined,
+      limit: searchParams.get("limit") ?? undefined,
     });
     const projectScope =
       principal.type === "api_key" && principal.projectId

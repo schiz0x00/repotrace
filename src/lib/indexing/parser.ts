@@ -253,6 +253,16 @@ function nearestAncestor(
 function extractName(node: Parser.SyntaxNode): string {
   const byField = node.childForFieldName("name");
   if (byField) return cleanName(byField.text);
+  // `const x = <expr>` — the declared name sits on the variable declarator,
+  // not the declaration (the value expression must not leak into the name).
+  if (node.type === "variable_declaration" || node.type === "lexical_declaration") {
+    for (const child of node.namedChildren) {
+      if (child.type === "variable_declarator") {
+        const n = child.childForFieldName("name");
+        if (n) return cleanName(n.text);
+      }
+    }
+  }
   // Arrow functions / function expressions: the name lives on the
   // enclosing variable declarator.
   const parent = node.parent;

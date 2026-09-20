@@ -52,15 +52,18 @@ async function loadGrammarModule(
     }
     return undefined;
   }
-  if (isEsm) return exports_.language ?? exports_.default?.language;
-  return exports_.language ?? exports_ ?? undefined;
+  // The default export IS the Language object for both the legacy bindings
+  // (module.exports = Language) and the 0.25-style bindings that also carry a
+  // `.language` namespace property which is NOT a Language (passing it to
+  // Parser.setLanguage throws).
+  return exports_ ?? undefined;
 }
 
 const grammarModules: Record<string, () => Promise<unknown> | unknown> = {
   typescript: () => loadGrammarModule("tree-sitter-typescript", ["typescript"]),
   tsx: () => loadGrammarModule("tree-sitter-typescript", ["tsx"]),
-  javascript: () => loadGrammarModule("tree-sitter-javascript", ["javascript"]),
-  python: () => loadGrammarModule("tree-sitter-python", ["python"]),
+  javascript: () => loadGrammarModule("tree-sitter-javascript"),
+  python: () => loadGrammarModule("tree-sitter-python"),
   go: () => loadGrammarModule("tree-sitter-go", ["go"]),
   rust: () => loadGrammarModule("tree-sitter-rust", ["rust"]),
   java: () => loadGrammarModule("tree-sitter-java", ["java"]),

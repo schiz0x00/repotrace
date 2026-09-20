@@ -18,10 +18,10 @@ export async function GET(request: Request, context: { params: Promise<{ idOrSlu
       limit: z.coerce.number().int().min(1).max(200).default(50),
     });
     const parsed = schema.parse({
-      q: searchParams.get("q"),
-      kind: searchParams.get("kind"),
-      language: searchParams.get("language"),
-      limit: searchParams.get("limit"),
+      q: searchParams.get("q") ?? undefined,
+      kind: searchParams.get("kind") ?? undefined,
+      language: searchParams.get("language") ?? undefined,
+      limit: searchParams.get("limit") ?? undefined,
     });
     const symbols = await searchSymbols(project.id, parsed.q, {
       limit: parsed.limit,

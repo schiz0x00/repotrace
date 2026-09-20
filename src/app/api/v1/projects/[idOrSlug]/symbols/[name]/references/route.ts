@@ -12,7 +12,7 @@ export async function GET(request: Request, context: { params: Promise<Record<st
     const { project } = await requireScopedProject(req, getParam(params, "idOrSlug"));
     const name = getParam(params, "name");
     const limit = z.coerce.number().int().min(1).max(100).default(50).parse(
-      new URL(req.url).searchParams.get("limit"),
+      new URL(req.url).searchParams.get("limit") ?? undefined,
     );
     const refs = await findReferences(project.id, name, limit);
     return json({ symbol: name, references: refs });

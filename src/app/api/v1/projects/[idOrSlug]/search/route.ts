@@ -33,10 +33,10 @@ export async function GET(request: Request, context: { params: Promise<{ idOrSlu
       languages: z.string().optional().transform((v) => (v ? v.split(",").filter(Boolean) : undefined)),
     });
     const parsed = schema.parse({
-      mode: searchParams.get("mode"),
-      limit: searchParams.get("limit"),
-      chunkTypes: searchParams.get("chunkTypes"),
-      languages: searchParams.get("languages"),
+      mode: searchParams.get("mode") ?? undefined,
+      limit: searchParams.get("limit") ?? undefined,
+      chunkTypes: searchParams.get("chunkTypes") ?? undefined,
+      languages: searchParams.get("languages") ?? undefined,
     });
 
     const result = await searchProject(project.id, q, {
@@ -46,22 +46,5 @@ export async function GET(request: Request, context: { params: Promise<{ idOrSlu
       languages: parsed.languages,
     });
     return json(result);
-  })(request, {});
-}
-
-/** POST /api/v1/projects/:idOrSlug/search/context — curated context bundle */
-export async function context(request: Request, context: { params: Promise<{ idOrSlug: string }> }) {
-  return route(async (req) => {
-    const { idOrSlug } = await context.params;
-    const { project } = await requireScopedProject(req, getParam({ idOrSlug }, "idOrSlug"));
-    const body = await req.json().catch(() => ({}));
-    const schema = z.object({
-      query: z.string().min(1).max(2000),
-      limit: z.number().int().min(1).max(12).default(8),
-    });
-    const { query, limit } = schema.parse(body);
-    const { buildContextBundle } = await import("@/lib/search/context");
-    const bundle = await buildContextBundle(project.id, query, { limit });
-    return json(bundle);
   })(request, {});
 }

@@ -79,19 +79,33 @@ export async function findReferences(
   target: string,
   limit = 50,
 ): Promise<SymbolHit[]> {
+  const simpleName = target.split(".").pop() ?? target;
+  // ponytail: fetch-cap 500 symbols/project then score in JS; if projects grow
+  // past ~10k symbols, move segment matching into a raw jsonb query.
   const symbols = await prisma().symbol.findMany({
-    where: {
-      projectId,
-      OR: [
-        { metadata: { path: ["calls"], array_contains: [target] } },
-        { metadata: { path: ["imports"], array_contains: [target] } },
-        { metadata: { path: ["extends"], array_contains: [target] } },
-      ],
-    },
+    where: { projectId },
     include: { file: { select: { path: true } } },
-    take: limit,
+    take: 500,
   });
-  return symbols.map(toSymbolHit);
+  // A call/import entry `a.b.c` references both `a` and `a.b` and `a.b.c`.
+  // Match exact, simple-name, or any prefix segment of the recorded name.
+  const scored = symbols
+    .map((s) => {
+      const meta = (s.metadata ?? {}) as { calls?: string[]; imports?: string[]; extends?: string[] };
+      let score = 0;
+      for (const key of ["calls", "imports", "extends"] as const) {
+        for (const e of meta[key] ?? []) {
+          const segs = e.split(".");
+          if (e === target || segs[segs.length - 1] === simpleName) score += 2;
+          else if (segs.includes(simpleName)) score += 1;
+        }
+      }
+      return { s, score };
+    })
+    .filter((x) => x.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
+  return scored.map(({ s }) => toSymbolHit(s));
 }
 
 /** What a symbol calls/imports/extends — its dependency list. */

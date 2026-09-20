@@ -1,3 +1,4 @@
+import "dotenv/config";
 import { Worker, type Job, type Processor } from "bullmq";
 import { env } from "@/lib/env";
 import { prisma } from "@/lib/prisma";

@@ -42,12 +42,24 @@ export function CommandPalette({
 
   React.useEffect(() => {
     if (!open) return
-    setProjects(null)
+    let cancelled = false
     fetch("/api/v1/projects")
       .then((res) => (res.ok ? res.json() : { projects: [] }) as Promise<{ projects: ProjectBrief[] }>)
-      .then((body) => setProjects(body.projects))
-      .catch(() => setProjects([]))
+      .then((body) => {
+        if (!cancelled) setProjects(body.projects)
+      })
+      .catch(() => {
+        if (!cancelled) setProjects([])
+      })
+    return () => {
+      cancelled = true
+    }
   }, [open])
+
+  const handleOpenChange = (next: boolean) => {
+    if (next) setProjects(null)
+    onOpenChange(next)
+  }
 
   const go = (href: string) => {
     onOpenChange(false)
@@ -56,7 +68,7 @@ export function CommandPalette({
 
   return (
     <Command>
-      <CommandDialog open={open} onOpenChange={onOpenChange}>
+      <CommandDialog open={open} onOpenChange={handleOpenChange}>
         <CommandInput placeholder="Type a command or search..." />
         <CommandList>
           <CommandEmpty>No results found.</CommandEmpty>

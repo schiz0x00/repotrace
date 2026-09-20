@@ -2,6 +2,7 @@
 
 import * as React from "react"
 import Link from "next/link"
+import { Suspense } from "react"
 import { useRouter, useSearchParams } from "next/navigation"
 import { authClient, errorMessage } from "@/components/dashboard/auth-client"
 import { Button } from "@/components/ui/button"
@@ -18,6 +19,14 @@ import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Loader2Icon } from "lucide-react"
 
 export default function LoginPage() {
+  return (
+    <Suspense fallback={null}>
+      <LoginForm />
+    </Suspense>
+  )
+}
+
+function LoginForm() {
   const router = useRouter()
   const searchParams = useSearchParams()
   const next = searchParams.get("next") ?? "/"

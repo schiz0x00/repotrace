@@ -43,7 +43,6 @@ export default function JobsPage() {
   }, [status])
 
   React.useEffect(() => {
-    setLoading(true)
     void load()
     const interval = setInterval(() => void load(), 5000)
     return () => clearInterval(interval)

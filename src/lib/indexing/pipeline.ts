@@ -116,7 +116,7 @@ export async function runIndexJob(ctx: IndexJobContext): Promise<IndexResult> {
 
   // ── Change detection ────────────────────────────────────────────────────
   let changes: GitChange[] | null = null;
-  let fromCommit: string | null = repo.lastKnownCommit;
+  const fromCommit: string | null = repo.lastKnownCommit;
   if (ctx.mode === "incremental" && fromCommit && head !== fromCommit) {
     if (await isAncestor(workspace, fromCommit, head)) {
       changes = await diffFiles(workspace, fromCommit, head);

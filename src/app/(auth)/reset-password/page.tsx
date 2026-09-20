@@ -2,6 +2,7 @@
 
 import * as React from "react"
 import Link from "next/link"
+import { Suspense } from "react"
 import { useRouter, useSearchParams } from "next/navigation"
 import { authClient, errorMessage } from "@/components/dashboard/auth-client"
 import { Button } from "@/components/ui/button"
@@ -18,6 +19,14 @@ import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Loader2Icon, LockKeyholeIcon } from "lucide-react"
 
 export default function ResetPasswordPage() {
+  return (
+    <Suspense fallback={null}>
+      <ResetPasswordForm />
+    </Suspense>
+  )
+}
+
+function ResetPasswordForm() {
   const router = useRouter()
   const searchParams = useSearchParams()
   const token = searchParams.get("token") ?? ""
@@ -69,7 +78,7 @@ export default function ResetPasswordPage() {
     <form onSubmit={onSubmit} className="gap-1.5! flex-col!">
       <CardHeader>
         <CardTitle>Set a new password</CardTitle>
-        <CardDescription>Choose a strong password you don't use elsewhere.</CardDescription>
+        <CardDescription>Choose a strong password you don&apos;t use elsewhere.</CardDescription>
       </CardHeader>
       <CardContent className="flex flex-col gap-3">
         {error && (

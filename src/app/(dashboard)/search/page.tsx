@@ -2,6 +2,7 @@
 
 import * as React from "react"
 import Link from "next/link"
+import { Suspense } from "react"
 import { useSearchParams } from "next/navigation"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -54,6 +55,14 @@ async function getJson<T>(path: string): Promise<T> {
 }
 
 export default function SearchPage() {
+  return (
+    <Suspense fallback={null}>
+      <SearchBody />
+    </Suspense>
+  )
+}
+
+function SearchBody() {
   const searchParams = useSearchParams()
   const [projects, setProjects] = React.useState<ProjectBrief[]>([])
   const [project, setProject] = React.useState(searchParams.get("project") ?? "")

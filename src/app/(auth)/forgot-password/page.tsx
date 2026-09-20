@@ -43,7 +43,7 @@ export default function ForgotPasswordPage() {
     <form onSubmit={onSubmit} className="gap-1.5! flex-col!">
       <CardHeader>
         <CardTitle>Reset your password</CardTitle>
-        <CardDescription>We'll email you a link to set a new password.</CardDescription>
+        <CardDescription>We&apos;ll email you a link to set a new password.</CardDescription>
       </CardHeader>
       <CardContent className="flex flex-col gap-3">
         {sent ? (

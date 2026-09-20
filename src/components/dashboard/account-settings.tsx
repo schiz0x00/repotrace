@@ -180,7 +180,7 @@ export function AccountSettings({ apiKeys, projects }: { apiKeys: ApiKeyDto[]; p
               <Alert>
                 <CircleCheckIcon />
                 <AlertDescription>
-                  Key <span className="font-medium">{created.name}</span> created. Copy it now — it won't be shown again.
+                  Key <span className="font-medium">{created.name}</span> created. Copy it now — it won&apos;t be shown again.
                 </AlertDescription>
               </Alert>
               <div className="flex items-center gap-2">

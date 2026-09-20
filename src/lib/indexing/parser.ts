@@ -337,8 +337,8 @@ function collectRelations(
       }
     }
     if (importTypes.has(current.type)) {
-      const module = importModuleFrom(current.text, path);
-      if (module) imports.push(module);
+      const mod = importModuleFrom(current.text, path);
+      if (mod) imports.push(mod);
     }
     for (const child of current.children) stack.push(child);
   }
@@ -374,8 +374,8 @@ function collectFileLevelRelations(
       calls.push(fn ? cleanCallName(fn.text) : cleanCallName(current.text.replace(/\(.*/, "")));
     }
     if (importTypes.has(current.type)) {
-      const module = importModuleFrom(current.text, path);
-      if (module) imports.push(module);
+      const mod = importModuleFrom(current.text, path);
+      if (mod) imports.push(mod);
     }
     for (const child of current.children) stack.push(child);
   }

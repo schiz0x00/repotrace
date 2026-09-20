@@ -43,11 +43,11 @@ async function loadGrammarModule(
   named?: string[],
   isEsm?: boolean,
 ): Promise<unknown> {
-  const mod: any = await import(pkg);
-  const exports_ = mod.default ?? mod;
+  const mod = (await import(pkg)) as Record<string, unknown>
+  const exports_ = (mod.default ?? mod) as Record<string, unknown>
   if (named) {
     for (const name of named) {
-      const candidate = exports_[name] ?? exports_.default?.[name];
+      const candidate = exports_[name] ?? (exports_.default as Record<string, unknown> | undefined)?.[name];
       if (candidate) return candidate;
     }
     return undefined;

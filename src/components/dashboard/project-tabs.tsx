@@ -146,30 +146,34 @@ function OverviewTab({ stats, indexStatus, recentJobs }: { stats: ProjectStats; 
 
 function FilesTab({ slug }: { slug: string }) {
   const [query, setQuery] = React.useState("")
-  const [status, setStatus] = React.useState<string>("")
   const [files, setFiles] = React.useState<FileDto[]>([])
   const [total, setTotal] = React.useState(0)
-  const [loading, setLoading] = React.useState(false)
+  const [loading, setLoading] = React.useState(true)
   const [error, setError] = React.useState<string | null>(null)
 
-  const load = React.useCallback(
+const load = React.useCallback(
     async (page = 1) => {
-      setLoading(true)
-      setError(null)
       try {
         const params = new URLSearchParams({ page: String(page), pageSize: "100" })
         if (query) params.set("path", query)
-        if (status) params.set("status", status)
         const data = await getJson<{ files: FileDto[]; total: number }>(`/api/v1/projects/${slug}/files?${params}`)
         setFiles(data.files)
         setTotal(data.total)
-      } catch (err) {
-        setError((err as Error).message)
+        setError(null)
       } finally {
         setLoading(false)
       }
     },
-    [slug, query, status],
+    [slug, query],
+  )
+
+  const refresh = React.useCallback(
+    (page = 1) => {
+      setLoading(true)
+      setError(null)
+      return load(page).catch((err: Error) => setError(err.message))
+    },
+    [load],
   )
 
   React.useEffect(() => {
@@ -184,7 +188,7 @@ function FilesTab({ slug }: { slug: string }) {
         <form
           onSubmit={(event) => {
             event.preventDefault()
-            void load(1)
+            void refresh(1)
           }}
         >
           <Input
@@ -254,24 +258,27 @@ function SymbolsTab({ slug }: { slug: string }) {
   const [query, setQuery] = React.useState("")
   const [kind, setKind] = React.useState<string>("")
   const [symbols, setSymbols] = React.useState<SymbolDto[]>([])
-  const [loading, setLoading] = React.useState(false)
+  const [loading, setLoading] = React.useState(true)
   const [error, setError] = React.useState<string | null>(null)
 
   const load = React.useCallback(async () => {
+      try {
+        const params = new URLSearchParams({ limit: "200" })
+        if (query) params.set("q", query)
+        if (kind) params.set("kind", kind)
+        const data = await getJson<{ symbols: SymbolDto[] }>(`/api/v1/projects/${slug}/symbols?${params}`)
+        setSymbols(data.symbols)
+        setError(null)
+      } finally {
+        setLoading(false)
+      }
+    }, [slug, query, kind])
+
+  const refresh = React.useCallback(() => {
     setLoading(true)
     setError(null)
-    try {
-      const params = new URLSearchParams({ limit: "200" })
-      if (query) params.set("q", query)
-      if (kind) params.set("kind", kind)
-      const data = await getJson<{ symbols: SymbolDto[] }>(`/api/v1/projects/${slug}/symbols?${params}`)
-      setSymbols(data.symbols)
-    } catch (err) {
-      setError((err as Error).message)
-    } finally {
-      setLoading(false)
-    }
-  }, [slug, query, kind])
+    return load().catch((err: Error) => setError(err.message))
+  }, [load])
 
   React.useEffect(() => {
     void load()
@@ -286,7 +293,7 @@ function SymbolsTab({ slug }: { slug: string }) {
           className="flex items-center gap-2"
           onSubmit={(event) => {
             event.preventDefault()
-            void load()
+            void refresh()
           }}
         >
           <Input
@@ -299,7 +306,7 @@ function SymbolsTab({ slug }: { slug: string }) {
             value={kind || null}
             onValueChange={(value) => {
               setKind(value ?? "")
-              void load()
+              void refresh()
             }}
           >
             <SelectTrigger className="w-32!">

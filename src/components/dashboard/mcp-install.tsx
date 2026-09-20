@@ -48,6 +48,7 @@ WORKFLOW:
 export function MCPInstall({ origin }: { origin: string }) {
   const mcpUrl = `${origin}/mcp`
   const prompt = buildPrompt(origin)
+  const installCommand = `claude mcp add repotrace --transport http --url ${mcpUrl} --header "Authorization: Bearer rt_<API_KEY>"`
 
   const copy = async (text: string, label: string) => {
     try {
@@ -82,19 +83,8 @@ export function MCPInstall({ origin }: { origin: string }) {
             </Button>
           </div>
           <div className="flex items-center justify-between gap-2 rounded-md border bg-muted px-3 py-2">
-            <code className="truncate text-xs">
-              claude mcp add repotrace --transport http --url {mcpUrl} --header "Authorization: Bearer rt_&lt;API_KEY&gt;"
-            </code>
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() =>
-                void copy(
-                  `claude mcp add repotrace --transport http --url ${mcpUrl} --header "Authorization: Bearer rt_<API_KEY>"`,
-                  "Config command",
-                )
-              }
-            >
+            <code className="truncate text-xs">{installCommand}</code>
+            <Button size="sm" variant="outline" onClick={() => void copy(installCommand, "Config command")}>
               <CopyIcon />
               Copy
             </Button>

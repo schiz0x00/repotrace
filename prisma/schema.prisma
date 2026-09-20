@@ -1,0 +1,344 @@
+generator client {
+  provider            = "prisma-client"
+  output              = "../src/generated/prisma"
+  runtime             = "nodejs"
+  moduleFormat        = "esm"
+  generatedFileExtension = "ts"
+  importFileExtension = "ts"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ── Better Auth core tables ────────────────────────────────────────────────
+
+model User {
+  id            String    @id
+  name          String
+  email         String
+  emailVerified Boolean   @default(false)
+  image         String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @default(now()) @updatedAt
+  sessions      Session[]
+  accounts      Account[]
+
+  @@unique([email])
+  @@map("user")
+}
+
+model Session {
+  id        String   @id
+  expiresAt DateTime
+  token     String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now()) @updatedAt
+  ipAddress String?
+  userAgent String?
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([token])
+  @@map("session")
+}
+
+model Account {
+  id                    String    @id
+  issuer                String
+  accountId             String
+  providerId            String
+  userId                String
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  password              String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  @@unique([issuer, accountId])
+  @@map("account")
+}
+
+model Verification {
+  id         String   @id
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @default(now()) @updatedAt
+
+  @@map("verification")
+}
+
+// ── Application tables ─────────────────────────────────────────────────────
+
+enum ProjectProvider {
+  github
+  gitlab
+  bitbucket
+  generic
+}
+
+enum ProjectStatus {
+  created
+  syncing
+  synced
+  error
+}
+
+enum FileStatus {
+  indexed
+  failed
+  removed
+}
+
+enum ChunkType {
+  code
+  documentation
+  configuration
+  test
+  other
+}
+
+enum ChunkStatus {
+  pending
+  embedded
+  failed
+}
+
+enum JobStatus {
+  queued
+  running
+  completed
+  failed
+  cancelled
+}
+
+enum JobType {
+  initial_index
+  incremental_index
+  full_reindex
+  reembed
+  repository_sync
+  delete_project
+}
+
+model Project {
+  id          String          @id @default(cuid())
+  name        String
+  slug        String          @unique
+  description String?
+  provider    ProjectProvider
+  repoUrl     String
+  defaultBranch String         @default("main")
+  status      ProjectStatus   @default(created)
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  // Embedding configuration (per project/index). Empty means "use system
+  // defaults from environment".
+  embeddingProvider String?
+  embeddingApiUrl   String?
+  embeddingApiKeyEnc String?
+  embeddingModel    String?
+  embeddingDimensions Int?
+  embeddingBatchSize Int?
+  embeddingVersion  Int? // increments when the model changes; never mixed in one collection
+
+  repository Repository?
+  files     File[]
+  symbols   Symbol[]
+  chunks    Chunk[]
+  jobs      Job[]
+  apiKeys   ApiKey[]
+  evalQuestions EvalQuestion[]
+
+  @@map("project")
+}
+
+model Repository {
+  id                  String          @id @default(cuid())
+  projectId           String          @unique
+  project             Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  provider            ProjectProvider
+  url                 String
+  branch              String
+  credentialsEncrypted String? // AES-256-GCM encrypted, never plaintext
+  lastKnownCommit     String?
+  lastSuccessfulSync  DateTime?
+  syncStatus          ProjectStatus   @default(created)
+  syncError           String?
+  createdAt           DateTime        @default(now())
+  updatedAt           DateTime        @updatedAt
+
+  files   File[]
+  commits Commit[]
+
+  @@map("repository")
+}
+
+model File {
+  id               String     @id @default(cuid())
+  projectId        String
+  project          Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  repositoryId     String
+  repository       Repository @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+  path             String
+  language         String
+  hash             String
+  size             Int
+  status           FileStatus @default(indexed)
+  error            String?
+  lastIndexedCommit String?
+  lastIndexedAt    DateTime?
+  createdAt        DateTime   @default(now())
+  updatedAt        DateTime   @updatedAt
+
+  symbols Symbol[]
+  chunks  Chunk[]
+
+  @@unique([repositoryId, path])
+  @@index([projectId])
+  @@map("file")
+}
+
+model Symbol {
+  id            String   @id @default(cuid())
+  projectId     String
+  project       Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  fileId        String
+  file          File     @relation(fields: [fileId], references: [id], onDelete: Cascade)
+  name          String
+  qualifiedName String
+  kind          String // function | method | class | interface | type | enum | module | route | constant | test | ...
+  language      String
+  startLine     Int
+  endLine       Int
+  parentName    String?
+  metadata      Json? // { calls: string[], imports: string[], implements: string[], extends: string[], doc: string? }
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  chunks Chunk[]
+
+  @@index([projectId, qualifiedName])
+  @@index([projectId, name])
+  @@index([fileId])
+  @@map("symbol")
+}
+
+model Chunk {
+  id               String     @id @default(cuid())
+  projectId        String
+  project          Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  fileId           String
+  file             File       @relation(fields: [fileId], references: [id], onDelete: Cascade)
+  symbolId         String?
+  symbol           Symbol?    @relation(fields: [symbolId], references: [id], onDelete: Cascade)
+  content          String
+  contentHash      String
+  chunkType        ChunkType
+  startLine        Int
+  endLine          Int
+  embeddingModel   String?
+  embeddingVersion Int?
+  status           ChunkStatus @default(pending)
+  error            String?
+  createdAt        DateTime   @default(now())
+  updatedAt        DateTime   @updatedAt
+
+  @@unique([fileId, contentHash, startLine])
+  @@index([projectId])
+  @@map("chunk")
+}
+
+model Commit {
+  id           String     @id @default(cuid())
+  repositoryId String
+  repository   Repository @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+  sha          String
+  message      String
+  author       String
+  authoredAt   DateTime
+
+  @@unique([repositoryId, sha])
+  @@map("commit")
+}
+
+model Job {
+  id          String    @id @default(cuid())
+  projectId   String?
+  project     Project?  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  type        JobType
+  status      JobStatus @default(queued)
+  progress    Int       @default(0)
+  stage       String?
+  error       String?
+  metadata    Json?
+  attempts    Int       @default(0)
+  startedAt   DateTime?
+  completedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([projectId, createdAt])
+  @@map("job")
+}
+
+model ApiKey {
+  id          String    @id @default(cuid())
+  name        String
+  keyPrefix   String
+  keyHash     String    @unique
+  projectId   String?
+  project     Project?  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  lastUsedAt  DateTime?
+  revokedAt   DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@map("api_key")
+}
+
+model WebhookDelivery {
+  id           String   @id @default(cuid())
+  provider     String
+  deliveryId   String?
+  projectId    String?
+  event        String?
+  status       String // received | processed | ignored | failed
+  error        String?
+  createdAt    DateTime @default(now())
+
+  @@unique([provider, deliveryId])
+  @@index([projectId, createdAt])
+  @@map("webhook_delivery")
+}
+
+model MetricEvent {
+  id        String   @id @default(cuid())
+  name      String // embedding_latency_ms | qdrant_latency_ms | search_latency_ms | indexing_duration_ms | embedding_failures | job_failures | queue_depth | ...
+  projectId String?
+  value     Float
+  recordedAt DateTime @default(now())
+
+  @@index([name, recordedAt])
+  @@index([projectId, recordedAt])
+  @@map("metric_event")
+}
+
+model EvalQuestion {
+  id            String   @id @default(cuid())
+  projectId     String
+  project       Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  question      String
+  expectedFiles String[] // paths expected in the result set
+  createdAt     DateTime @default(now())
+
+  @@index([projectId])
+  @@map("eval_question")
+}

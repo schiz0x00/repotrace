@@ -29,7 +29,7 @@ export const auth = betterAuth({
     useSecureCookies: env().USE_SECURE_COOKIES,
     defaultCookieAttributes: {
       httpOnly: true,
-      sameSite: "lax",
+      sameSite: "strict",
       secure: env().USE_SECURE_COOKIES,
     },
   },

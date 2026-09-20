@@ -95,7 +95,7 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
 
   return (
     <SidebarProvider>
-      <Sidebar collapsible="icon">
+      <Sidebar collapsible="offcanvas">
         <SidebarHeader className="p-2!">
           <SidebarMenuButton
             render={<Link href="/" />}

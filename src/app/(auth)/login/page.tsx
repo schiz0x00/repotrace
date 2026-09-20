@@ -45,7 +45,7 @@ function LoginForm() {
       setPending(false)
       return
     }
-    router.push(next)
+    router.push("/");
   }
 
   return (

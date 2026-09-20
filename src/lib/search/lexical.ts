@@ -46,46 +46,28 @@ export async function lexicalSearch(
 
   let rows: LexicalHit[];
   try {
+    const safeQuery = q.replace(/[^a-zA-Z0-9_\s]/g, " ").trim();
+    const tsq = safeQuery ? `to_tsquery('simple', '${safeQuery.replace(/'/g, "''")}')` : "''";
     rows = await db.$queryRawUnsafe<LexicalHit[]>(
       `SELECT
          c.id AS "chunkId", c."fileId" AS "fileId", f.path, f.language,
          s."qualifiedName" AS symbol, s.kind AS "symbolKind",
          c."startLine" AS "startLine", c."endLine" AS "endLine",
          c.content, c."chunkType" AS "chunkType",
-         ts_rank(c.content_tsv, query) AS score
+         ts_rank(c.content_tsv, (${tsq})) AS score
        FROM "chunk" c
        JOIN "file" f ON f.id = c."fileId"
        LEFT JOIN "symbol" s ON s.id = c."symbolId"
-       JOIN (SELECT to_tsquery('simple', $1) AS query) q ON c.content_tsv @@ q.query
-       WHERE c."projectId" = $2
+       WHERE c."projectId" = $1
          ${chunkTypeFilter} ${languageFilter} ${pathFilter}
+         AND c.content_tsv @@ (${tsq})
        ORDER BY score DESC
-       LIMIT $3`,
-      query,
+       LIMIT $2`,
       projectId,
       opts.limit,
     );
-  } catch {
-    // Invalid tsquery syntax (special characters): fall back to substring match.
-    rows = await db.$queryRawUnsafe<LexicalHit[]>(
-      `SELECT
-         c.id AS "chunkId", c."fileId" AS "fileId", f.path, f.language,
-         s."qualifiedName" AS symbol, s.kind AS "symbolKind",
-         c."startLine" AS "startLine", c."endLine" AS "endLine",
-         c.content, c."chunkType" AS "chunkType",
-         (c.content ILIKE $1)::int AS score
-       FROM "chunk" c
-       JOIN "file" f ON f.id = c."fileId"
-       LEFT JOIN "symbol" s ON s.id = c."symbolId"
-       WHERE c."projectId" = $2
-         AND c.content ILIKE $1
-         ${chunkTypeFilter} ${languageFilter} ${pathFilter}
-       ORDER BY length(c.content)
-       LIMIT $3`,
-      `%${q}%`,
-      projectId,
-      opts.limit,
-    );
+  } catch (e) {
+    throw new Error(`Lexical search failed: ${e}`);
   }
   return rows;
 }

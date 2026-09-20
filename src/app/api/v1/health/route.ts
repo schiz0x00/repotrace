@@ -14,7 +14,7 @@ export const runtime = "nodejs";
  */
 export async function GET(request: Request) {
   return route(async (req) => {
-    await requirePrincipal(req);
+    // Health endpoint is public — no auth required for proxies/load balancers.
     const started = Date.now();
 
     // PostgreSQL

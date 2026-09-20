@@ -102,13 +102,7 @@ export function parseFile(path: string, content: string): ParsedFile {
     parser.setLanguage(grammar);
     tree = parser.parse(content);
   } catch (err) {
-    // Never let one malformed file destroy the index job.
-    return {
-      language: id,
-      symbols: [],
-      chunks: fallbackChunks(content, category),
-      error: (err as Error).message,
-    };
+    throw new Error(`Parse failed for ${path}: ${(err as Error).message}`);
   }
 
   const { definition: def } = detectLanguage(path);

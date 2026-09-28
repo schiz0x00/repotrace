@@ -1,7 +1,8 @@
 import Link from "next/link"
+import { env } from "@/lib/env"
 import { api } from "@/components/dashboard/data"
 import { ProjectActions } from "@/components/dashboard/project-actions"
-import { ProjectTabs } from "@/components/dashboard/project-tabs"
+import { ProjectTabs, type WebhookSecretSource } from "@/components/dashboard/project-tabs"
 import { Card, CardContent } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Breadcrumb, BreadcrumbItem, BreadcrumbLink, BreadcrumbList, BreadcrumbPage, BreadcrumbSeparator } from "@/components/ui/breadcrumb"
@@ -27,17 +28,35 @@ interface WebhookResponse {
 
 export default async function ProjectDetailPage({ params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params
-  const [projectRes, statsRes, indexStatusRes, jobsRes, webhookRes] = await Promise.all([
+  const [projectRes, statsRes, jobsRes, webhookRes, indexStatusResult] = await Promise.all([
     api<{ project: ProjectDto }>(`/api/v1/projects/${slug}`),
     api<StatsResponse>(`/api/v1/projects/${slug}/stats`),
-    api<IndexStatusResponse>(`/api/v1/projects/${slug}/index-status`),
     api<JobsResponse>(`/api/v1/jobs?project=${slug}&limit=10`),
     api<WebhookResponse>(`/api/v1/projects/${slug}/webhook`),
+    // The index-status read is isolated from the rest: it is the one call that
+    // can fail for reasons that have nothing to do with the page being
+    // viewable (a Qdrant collection that cannot be reached, a 500 from the
+    // status route). Letting it reject took the whole page down with it, and
+    // the alternative — treating a failed read as a status of "no model
+    // recorded" — rendered the system default and left the project looking
+    // healthy. The failure is carried alongside and shown as unknown.
+    api<IndexStatusResponse>(`/api/v1/projects/${slug}/index-status`).then(
+      (res) => ({ indexStatus: res.indexStatus, indexStatusError: null as string | null }),
+      (err: unknown) => ({
+        indexStatus: null,
+        indexStatusError: err instanceof Error ? err.message : "The index status request failed.",
+      }),
+    ),
   ])
 
   const project = projectRes.project
   const stats = statsRes.stats
-  const indexStatus = indexStatusRes.indexStatus
+  const { indexStatus, indexStatusError } = indexStatusResult
+  // `webhookSecretFor()` prefers the process-wide GITHUB_WEBHOOK_SECRET over the
+  // per-project secret the webhook endpoint hands out, so the settings tab has
+  // to say which one is actually in force. The global value itself is not sent
+  // to the browser: it authorises delivery for every project on the instance.
+  const webhookSecretSource: WebhookSecretSource = env().GITHUB_WEBHOOK_SECRET ? "global" : "project"
 
   return (
     <div className="flex flex-col gap-6">
@@ -82,8 +101,17 @@ export default async function ProjectDetailPage({ params }: { params: Promise<{ 
             )}
           </div>
           <div className="mt-1 text-xs text-muted-foreground">
-            Last indexed {formatRelative(indexStatus.lastSuccessfulSync)} · {indexStatus.embeddingModel ?? "default model"}
-            {indexStatus.embeddingDimensions ? ` · ${indexStatus.embeddingDimensions}d` : ""}
+            {indexStatus === null ? (
+              // Same rule as the tabs below: an unreadable status is not a
+              // status. "default model" here would read as a verified claim
+              // about an index nobody has managed to inspect.
+              <>Index status unreadable — last sync and embedding model are unknown{indexStatusError ? `: ${indexStatusError}` : "."}</>
+            ) : (
+              <>
+                Last indexed {formatRelative(indexStatus.lastSuccessfulSync)} · {indexStatus.embeddingModel ?? "default model"}
+                {indexStatus.embeddingDimensions ? ` · ${indexStatus.embeddingDimensions}d` : ""}
+              </>
+            )}
           </div>
         </div>
         <ProjectActions project={project} />
@@ -93,8 +121,15 @@ export default async function ProjectDetailPage({ params }: { params: Promise<{ 
         slug={project.slug}
         stats={stats}
         indexStatus={indexStatus}
+        indexStatusError={indexStatusError}
         recentJobs={jobsRes.jobs}
         webhook={webhookRes.webhook}
+        webhookSecretSource={webhookSecretSource}
+        // The settings form edits the per-project embedding override. It was
+        // previously handed a hardcoded all-null object, so the form always
+        // rendered empty: an operator could not see or edit a project's
+        // override, and saving appeared to do nothing.
+        embedding={project.embedding}
       />
     </div>
   )

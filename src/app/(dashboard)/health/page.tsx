@@ -32,7 +32,11 @@ function Check({ icon, name, detail, healthy, error }: CheckProps) {
 }
 
 export default async function HealthPage() {
-  const health = await api<HealthResponse>("/api/v1/health")
+  // The rich view: /api/v1/health is the public liveness probe and returns bare
+  // component booleans (no embedding/repositorySync/workers detail, no version).
+  // `api` forwards the session cookie, so the authenticated endpoint is the one
+  // the dashboard should read.
+  const health = await api<HealthResponse>("/api/v1/health/status")
   const checks = health.checks
 
   return (

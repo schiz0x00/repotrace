@@ -19,6 +19,7 @@ export interface ProjectDto {
   updatedAt: string
   embedding: {
     provider: string | null
+    apiUrl: string | null
     model: string | null
     dimensions: number | null
     batchSize: number | null
@@ -81,11 +82,64 @@ export interface IndexStatus {
   embeddingModel: string | null
   embeddingDimensions: number | null
   embeddingVersion: number | null
+  /** Dimensionality the Qdrant collection was actually created with. */
+  collectionDimensions: number | null
+  /** Collection size no longer matches the configured model. */
+  dimensionsMismatch: boolean
+  /** Chunks exist but nothing is embedded at the current version. */
+  reembedRequired: boolean
   status: string
   lastIndexedCommit: string | null
   lastSuccessfulSync: string | null
   activeJob: JobDto | null
   lastJob: JobDto | null
+}
+
+export interface CommitDto {
+  sha: string
+  shortSha: string
+  subject: string
+  author: string
+  authoredAt: string
+}
+
+export interface CommitsResponse {
+  commits: CommitDto[]
+  nextBefore: string | null
+  repository: {
+    branch: string
+    lastKnownCommit: string | null
+    syncStatus: string
+    lastSuccessfulSync: string | null
+  } | null
+}
+
+export interface EvalQuestionResult {
+  id: string
+  query: string
+  mode: string
+  expectedFiles: string[]
+  expectedSymbols: string[]
+  recallFiles: Record<string, number>
+  recallSymbols: Record<string, number>
+  contextHitRate: number | null
+  topFiles: string[]
+  error?: string
+}
+
+export interface EvalsResponse {
+  questions: EvalQuestionResult[]
+  aggregate: {
+    questions: number
+    failed: number
+    recallFilesAt5: number | null
+    recallFilesAt10: number | null
+    recallSymbolsAt5: number | null
+    recallSymbolsAt10: number | null
+    contextHitRate: number | null
+  }
+  k: number[]
+  truncated?: number
 }
 
 export interface FileDto {
@@ -137,6 +191,13 @@ export interface SearchResponse {
   tookMs: number
 }
 
+/**
+ * Rich diagnostic payload from the authenticated `GET /api/v1/health/status`.
+ *
+ * This is NOT the shape of `GET /api/v1/health`, which is the public liveness
+ * probe and returns bare component booleans. The dashboard reads the status
+ * endpoint (it forwards the session cookie), so it gets the full view.
+ */
 export interface HealthResponse {
   status: string
   checks: {

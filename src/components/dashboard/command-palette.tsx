@@ -12,7 +12,8 @@ import {
   CommandList,
   CommandShortcut,
 } from "@/components/ui/command"
-import { LayoutDashboardIcon, FolderGit2Icon, SearchIcon, ListTodoIcon, BoxesIcon, HeartPulseIcon, SettingsIcon, CodeXmlIcon, Loader2Icon, PlugZapIcon } from "lucide-react"
+import { LayoutDashboardIcon, FolderGit2Icon, SearchIcon, ListTodoIcon, BoxesIcon, HeartPulseIcon, SettingsIcon, CodeXmlIcon, Loader2Icon, PlugZapIcon, TriangleAlertIcon } from "lucide-react"
+import { getJson } from "@/components/dashboard/dashboard-helpers"
 
 const NAV_ACTIONS = [
   { href: "/", label: "Overview", icon: LayoutDashboardIcon },
@@ -39,17 +40,25 @@ export function CommandPalette({
 }) {
   const router = useRouter()
   const [projects, setProjects] = React.useState<ProjectBrief[] | null>(null)
+  const [error, setError] = React.useState<string | null>(null)
 
   React.useEffect(() => {
     if (!open) return
     let cancelled = false
-    fetch("/api/v1/projects")
-      .then((res) => (res.ok ? res.json() : { projects: [] }) as Promise<{ projects: ProjectBrief[] }>)
+    // getJson checks res.ok and throws the API's message. The previous
+    // `res.ok ? res.json() : { projects: [] }` turned every 401/500 into an
+    // empty list, so an expired session rendered "No projects yet" — the same
+    // false story the search page had.
+    getJson<{ projects: ProjectBrief[] }>("/api/v1/projects")
       .then((body) => {
-        if (!cancelled) setProjects(body.projects)
+        if (cancelled) return
+        setProjects(body.projects)
+        setError(null)
       })
-      .catch(() => {
-        if (!cancelled) setProjects([])
+      .catch((err: Error) => {
+        if (cancelled) return
+        setProjects([])
+        setError(err.message)
       })
     return () => {
       cancelled = true
@@ -57,7 +66,10 @@ export function CommandPalette({
   }, [open])
 
   const handleOpenChange = (next: boolean) => {
-    if (next) setProjects(null)
+    if (next) {
+      setProjects(null)
+      setError(null)
+    }
     onOpenChange(next)
   }
 
@@ -81,7 +93,12 @@ export function CommandPalette({
             ))}
           </CommandGroup>
           <CommandGroup heading="Projects">
-            {projects === null ? (
+            {error ? (
+              <CommandItem disabled>
+                <TriangleAlertIcon />
+                Could not load projects: {error}
+              </CommandItem>
+            ) : projects === null ? (
               <CommandItem disabled>
                 <Loader2Icon className="size-4 animate-spin" />
                 Loading projects…

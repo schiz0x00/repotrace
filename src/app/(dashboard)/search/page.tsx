@@ -10,8 +10,9 @@ import { Label } from "@/components/ui/label"
 import { Card, CardContent } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
-import { Alert, AlertDescription } from "@/components/ui/alert"
-import { SearchIcon, Loader2Icon, CodeXmlIcon } from "lucide-react"
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
+import { SearchIcon, Loader2Icon, CodeXmlIcon, CircleAlertIcon } from "lucide-react"
+import { getJson, pickDefaultProject } from "@/components/dashboard/dashboard-helpers"
 
 const MODES = [
   { value: "hybrid", label: "Hybrid" },
@@ -45,15 +46,6 @@ interface SearchData {
   project: { name: string } | null
 }
 
-async function getJson<T>(path: string): Promise<T> {
-  const res = await fetch(path)
-  if (!res.ok) {
-    const json = await res.json().catch(() => null)
-    throw new Error((json as { error?: { message?: string } })?.error?.message ?? `Request failed (${res.status})`)
-  }
-  return res.json() as Promise<T>
-}
-
 export default function SearchPage() {
   return (
     <Suspense fallback={null}>
@@ -64,21 +56,54 @@ export default function SearchPage() {
 
 function SearchBody() {
   const searchParams = useSearchParams()
-  const [projects, setProjects] = React.useState<ProjectBrief[]>([])
-  const [project, setProject] = React.useState(searchParams.get("project") ?? "")
+  // `null` means "not loaded yet" — distinct from an empty list, so the page
+  // does not flash "No projects yet" while the request is still in flight.
+  const [projects, setProjects] = React.useState<ProjectBrief[] | null>(null)
+  const paramProject = searchParams.get("project") ?? ""
+  const [project, setProject] = React.useState(paramProject)
+  // `useSearchParams` re-renders this component when a client-side navigation
+  // changes the query string — the command palette links to /search?project=SLUG
+  // — but a useState initializer runs only on mount, so navigating to another
+  // project from an already-mounted page kept the previous selection. Re-syncing
+  // during render keeps the URL authoritative; React discards the render that
+  // assigns state, so the stale value is never painted. Guarding the assignment
+  // in an `if` is what keeps it legal here: this repo's setState-in-render and
+  // setState-in-effect rules both error on an unconditional call, so the
+  // alternative — setting it from an effect — is not available.
+  //
+  // Only a PRESENT parameter is applied. An absent one is silence, not a
+  // request to deselect: the sidebar links to a bare `/search`, and treating
+  // that as "project = none" wiped a working selection every time the operator
+  // used it. The default is applied once, by the fetch below.
+  const [syncedParam, setSyncedParam] = React.useState(paramProject)
+  if (paramProject && paramProject !== syncedParam) {
+    setSyncedParam(paramProject)
+    setProject(paramProject)
+  }
   const [query, setQuery] = React.useState("")
   const [mode, setMode] = React.useState("hybrid")
   const [result, setResult] = React.useState<SearchData | null>(null)
   const [loading, setLoading] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
+  const [projectsError, setProjectsError] = React.useState<string | null>(null)
 
   React.useEffect(() => {
+    // Empty dependency list on purpose: this effect writes `project` itself, so
+    // depending on it would refetch /api/v1/projects every time the default was
+    // applied — two requests per page load. The functional update reads the
+    // current value instead, so a `?project=` parameter or a later choice wins.
     void getJson<{ projects: ProjectBrief[] }>("/api/v1/projects")
-      .then(({ projects }) => {
-        setProjects(projects)
-        if (!project && projects.length > 0) setProject(projects[0].slug)
+      .then(({ projects: list }) => {
+        setProjects(list)
+        setProjectsError(null)
+        setProject((current) => pickDefaultProject(current, list))
       })
-      .catch(() => {})
+      .catch((err: Error) => {
+        // Swallowed, this left the page rendering "No projects yet" — which
+        // reads as "you have not created a project" when the truth is that the
+        // request failed, e.g. an expired session.
+        setProjectsError(err.message)
+      })
   }, [])
 
   const run = async () => {
@@ -121,7 +146,7 @@ function SearchBody() {
               <SelectValue placeholder="Select a project" />
             </SelectTrigger>
             <SelectContent>
-              {projects.map((p) => (
+              {(projects ?? []).map((p) => (
                 <SelectItem key={p.slug} value={p.slug}>
                   {p.name}
                 </SelectItem>
@@ -215,7 +240,20 @@ function SearchBody() {
         </div>
       )}
 
-      {!result && !error && projects.length === 0 && (
+      {!result && !error && projectsError && (
+        <Alert variant="destructive">
+          <CircleAlertIcon className="size-4" />
+          <AlertTitle>Could not load projects</AlertTitle>
+          <AlertDescription>{projectsError}</AlertDescription>
+        </Alert>
+      )}
+      {!result && !error && !projectsError && projects === null && (
+        <div className="flex items-center gap-2 py-8 text-muted-foreground">
+          <Loader2Icon className="size-4 animate-spin" />
+          <span className="text-sm">Loading projects…</span>
+        </div>
+      )}
+      {!result && !error && !projectsError && projects !== null && projects.length === 0 && (
         <Card>
           <CardContent className="flex flex-col items-center gap-2 py-10 text-muted-foreground">
             <CodeXmlIcon className="size-6" />

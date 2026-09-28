@@ -5,6 +5,7 @@ import Link from "next/link"
 import { Suspense } from "react"
 import { useRouter, useSearchParams } from "next/navigation"
 import { authClient, errorMessage } from "@/components/dashboard/auth-client"
+import { safeNext } from "./safe-next"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -29,7 +30,7 @@ export default function LoginPage() {
 function LoginForm() {
   const router = useRouter()
   const searchParams = useSearchParams()
-  const next = searchParams.get("next") ?? "/"
+  const next = safeNext(searchParams.get("next"))
   const [email, setEmail] = React.useState("")
   const [password, setPassword] = React.useState("")
   const [pending, setPending] = React.useState(false)
@@ -45,7 +46,10 @@ function LoginForm() {
       setPending(false)
       return
     }
-    router.push("/");
+    // Honour the page the user was trying to reach (set by proxy.ts when it
+    // redirects an unauthenticated request to /login).
+    router.push(next);
+    router.refresh();
   }
 
   return (

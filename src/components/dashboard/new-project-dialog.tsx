@@ -53,18 +53,32 @@ export function NewProjectDialog() {
   const onSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const form = new FormData(event.currentTarget)
+    // `FormData.get` returns null for an absent or empty field, and a cast
+    // does not change that: every blank input used to become an explicit
+    // `null`, `Object.values(...).some((v) => v !== undefined)` was therefore
+    // always true, and an `embedding` object full of nulls was sent on every
+    // submission. The server's zod schema rejects `null` for every field, so
+    // creating a project from this dialog failed with a 400 every time.
+    const text = (name: string): string | undefined => {
+      const v = form.get(name);
+      if (typeof v !== "string") return undefined;
+      const trimmed = v.trim();
+      return trimmed.length > 0 ? trimmed : undefined;
+    };
+    const num = (name: string): number | undefined => {
+      const v = text(name);
+      if (v === undefined) return undefined;
+      const n = Number(v);
+      return Number.isFinite(n) && n > 0 ? n : undefined;
+    };
     const embedding = {
-      provider: form.get("embeddingProvider") as string | undefined,
-      apiUrl: (form.get("embeddingApiUrl") as string | undefined) ?? undefined,
-      apiKey: (form.get("embeddingApiKey") as string | undefined) ?? undefined,
-      model: form.get("embeddingModel") as string | undefined,
-      dimensions: (form.get("embeddingDimensions") as string | undefined)
-        ? Number(form.get("embeddingDimensions"))
-        : undefined,
-      batchSize: (form.get("embeddingBatchSize") as string | undefined)
-        ? Number(form.get("embeddingBatchSize"))
-        : undefined,
-    }
+      provider: text("embeddingProvider"),
+      apiUrl: text("embeddingApiUrl"),
+      apiKey: text("embeddingApiKey"),
+      model: text("embeddingModel"),
+      dimensions: num("embeddingDimensions"),
+      batchSize: num("embeddingBatchSize"),
+    };
     const credentials = (form.get("token") as string | undefined)?.trim()
     const body = {
       name: form.get("name") as string,
@@ -78,27 +92,51 @@ export function NewProjectDialog() {
 
     setPending(true)
     setError(null)
-    const res = await fetch("/api/v1/projects", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
-    })
-    if (!res.ok) {
-      const json = await res.json().catch(() => null)
-      setError((json as { error?: { message?: string } })?.error?.message ?? "Could not create project.")
+    // try/finally: the create POST rejects on a transport failure, and without
+    // this the dialog was stuck with a disabled Create button and no message.
+    try {
+      const res = await fetch("/api/v1/projects", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      })
+      if (!res.ok) {
+        const json = await res.json().catch(() => null)
+        setError((json as { error?: { message?: string } })?.error?.message ?? "Could not create project.")
+        return
+      }
+      const { project } = (await res.json()) as { project: { slug: string } }
+      // The project exists at this point, but indexing is a separate request and
+      // the outcome is discarded: `.catch(() => {})` plus an unconditional
+      // "indexing started" meant a failed enqueue was reported as success. The
+      // project was created with nothing indexing it, and the only clue was an
+      // empty Jobs page.
+      let indexError: string | null = null
+      try {
+        const indexRes = await fetch(`/api/v1/projects/${project.slug}/reindex`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ type: "initial" }),
+        })
+        if (!indexRes.ok) {
+          const body = (await indexRes.json().catch(() => null)) as { error?: { message?: string } } | null
+          indexError = body?.error?.message ?? `HTTP ${indexRes.status}`
+        }
+      } catch (err) {
+        indexError = (err as Error).message
+      }
+      if (indexError) {
+        toast.error(`Project "${project.slug}" created, but indexing could not start: ${indexError}`)
+      } else {
+        toast.success(`Project "${project.slug}" created — indexing started.`)
+      }
+      setOpen(false)
+      router.refresh()
+    } catch (err) {
+      setError(`Could not create project: ${(err as Error).message}`)
+    } finally {
       setPending(false)
-      return
     }
-    const { project } = (await res.json()) as { project: { slug: string } }
-    await fetch(`/api/v1/projects/${project.slug}/reindex`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ type: "initial" }),
-    }).catch(() => {})
-    toast.success(`Project "${project.slug}" created — indexing started.`)
-    setOpen(false)
-    setPending(false)
-    router.refresh()
   }
 
   return (

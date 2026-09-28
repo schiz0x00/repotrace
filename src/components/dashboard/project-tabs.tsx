@@ -30,13 +30,15 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Progress, ProgressValue } from "@/components/ui/progress"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { JobsTable, jobTypeLabel } from "@/components/dashboard/jobs-table"
-import { deleteProject, postAction } from "@/components/dashboard/project-actions"
+import { apiErrorMessage, createRequestGate, deleteProject, getJson, postAction } from "@/components/dashboard/dashboard-helpers"
 import {
   FileCode2Icon,
   BracesIcon,
   BoxesIcon,
   GitCommitHorizontalIcon,
+  TargetIcon,
   CircleXIcon,
+  CircleCheckIcon,
   Loader2Icon,
   SearchIcon,
   EyeIcon,
@@ -48,16 +50,30 @@ import {
   CircleAlertIcon,
   RotateCcwIcon,
 } from "lucide-react"
-import type { FileDto, IndexStatus, JobDto, ProjectStats, SymbolDto, WebhookInfo } from "@/components/dashboard/types"
+import type {
+  CommitsResponse,
+  EvalsResponse,
+  FileDto,
+  IndexStatus,
+  JobDto,
+  ProjectStats,
+  SymbolDto,
+  WebhookInfo,
+} from "@/components/dashboard/types"
 import { formatBytes, formatNumber, formatRelative } from "@/components/dashboard/types"
 
-async function getJson<T>(path: string): Promise<T> {
-  const res = await fetch(path)
-  if (!res.ok) {
-    const json = await res.json().catch(() => null)
-    throw new Error((json as { error?: { message?: string } })?.error?.message ?? `Request failed (${res.status})`)
+/**
+ * Clipboard write with the rejection handled: `navigator.clipboard.writeText`
+ * rejects when the document is not focused or permission is denied, and an
+ * unhandled rejection in a click handler is silent.
+ */
+async function copyToClipboard(text: string, label: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(text)
+    toast.success(`${label} copied.`)
+  } catch {
+    toast.error("Could not copy — your browser blocked clipboard access.")
   }
-  return res.json() as Promise<T>
 }
 
 function PanelCard({ title, description, action, children }: { title: string; description?: string; action?: React.ReactNode; children: React.ReactNode }) {
@@ -90,17 +106,83 @@ const FILE_STATUS_VARIANT: Record<string, "default" | "secondary" | "outline" | 
 
 const SYMBOL_KINDS = ["class", "function", "method", "variable", "constant", "interface", "struct", "enum", "type", "module", "namespace", "property", "field", "parameter", "import", "export"]
 
+/**
+ * Body that removes every per-project embedding override.
+ *
+ * `null` is the API's "remove this field"; an absent key means "leave it
+ * alone". The key is included even though this form can never display it,
+ * because a stored key is otherwise unreachable: blanking the field is
+ * indistinguishable, on the wire, from leaving it unchanged.
+ */
+export const CLEARED_EMBEDDING_OVERRIDES = {
+  provider: null,
+  apiUrl: null,
+  apiKey: null,
+  model: null,
+  dimensions: null,
+  batchSize: null,
+} as const
 
-function OverviewTab({ stats, indexStatus, recentJobs }: { stats: ProjectStats; indexStatus: IndexStatus; recentJobs: JobDto[] }) {
+
+function IndexStatusAlert({ indexStatus, indexStatusError }: { indexStatus: IndexStatus | null; indexStatusError: string | null }) {
+  // `reembedRequired` comes out of the same read that failed, so a project whose
+  // status could not be read is neither known to need a re-embed nor known to be
+  // fine. Falling through to the healthy branch — or to the project record's
+  // configured model — presented an unreadable index as a healthy one.
+  if (indexStatus === null) {
+    return (
+      <Alert variant="destructive">
+        <TriangleAlertIcon />
+        <AlertTitle>Index status unreadable</AlertTitle>
+        <AlertDescription>
+          The index status of this project could not be read, so its vector count and re-embed state are unknown — it is
+          neither known to need a re-embed nor known to be healthy. {indexStatusError ?? "The request failed."}
+        </AlertDescription>
+      </Alert>
+    )
+  }
+  if (indexStatus.reembedRequired) {
+    return (
+      <Alert variant="destructive">
+        <TriangleAlertIcon />
+        <AlertTitle>Re-embed required</AlertTitle>
+        <AlertDescription>
+          The embedding model or dimensions changed after these vectors were written. They were produced by a different
+          model and cannot be compared against new ones — trigger a re-embed to rebuild the index.
+        </AlertDescription>
+      </Alert>
+    )
+  }
+  return null
+}
+
+function OverviewTab({
+  stats,
+  indexStatus,
+  indexStatusError,
+  recentJobs,
+}: {
+  stats: ProjectStats
+  indexStatus: IndexStatus | null
+  indexStatusError: string | null
+  recentJobs: JobDto[]
+}) {
   const cards = [
     { icon: <FileCode2Icon />, label: "Files", value: formatNumber(stats.files) },
     { icon: <BracesIcon />, label: "Symbols", value: formatNumber(stats.symbols) },
     { icon: <BoxesIcon />, label: "Chunks", value: formatNumber(stats.chunks) },
-    { icon: <BoxesIcon />, label: "Vectors", value: indexStatus.vectors >= 0 ? formatNumber(indexStatus.vectors) : "n/a" },
+    {
+      icon: <BoxesIcon />,
+      label: "Vectors",
+      // "n/a" means the server reported a negative count; "unknown" means the
+      // server never answered. Collapsing the two is the bug this avoids.
+      value: indexStatus === null ? "unknown" : indexStatus.vectors >= 0 ? formatNumber(indexStatus.vectors) : "n/a",
+    },
     { icon: <GitCommitHorizontalIcon />, label: "Commits", value: formatNumber(stats.commits) },
   ]
   return (
     <div className="flex flex-col gap-4">
+      <IndexStatusAlert indexStatus={indexStatus} indexStatusError={indexStatusError} />
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
         {cards.map(({ icon, label, value }) => (
           <Card key={label} className="flex-1!">
@@ -151,33 +233,61 @@ function FilesTab({ slug }: { slug: string }) {
   const [loading, setLoading] = React.useState(true)
   const [error, setError] = React.useState<string | null>(null)
 
+// Monotonic request counter; see the note inside `load` for what it is for.
+const [gate] = React.useState(createRequestGate)
+
+// Why a separate callback rather than inlining the fetch in the effect: the
+// effect below is keyed on `load`, so `load`'s dependency list ([slug, query])
+// is what decides when a filter change re-fetches. Inlining would spread that
+// list across the effect's deps and make `refresh` a second copy of the request.
+// It is not about render timing — every setState here is in a promise callback,
+// after the effect that started the request has already returned.
 const load = React.useCallback(
-    async (page = 1) => {
-      try {
-        const params = new URLSearchParams({ page: String(page), pageSize: "100" })
-        if (query) params.set("path", query)
-        const data = await getJson<{ files: FileDto[]; total: number }>(`/api/v1/projects/${slug}/files?${params}`)
-        setFiles(data.files)
-        setTotal(data.total)
-        setError(null)
-      } finally {
-        setLoading(false)
-      }
+    (page = 1) => {
+      // `query` is live on every keystroke and each keystroke fires a request,
+      // so responses can arrive out of order: a slow request for "src/" would
+      // otherwise land after a fast one for "src/app" and repopulate the table
+      // with results for a prefix the user has typed past. The gate counts
+      // requests; a response is applied only if it is still the newest.
+      const requestId = gate.next()
+      const params = new URLSearchParams({ page: String(page), pageSize: "100" })
+      if (query) params.set("path", query)
+      return getJson<{ files: FileDto[]; total: number }>(`/api/v1/projects/${slug}/files?${params}`)
+        .then((data) => {
+          if (!gate.isCurrent(requestId)) return
+          setFiles(data.files)
+          setTotal(data.total)
+          setError(null)
+        })
+        // The catch used to live in `refresh` only, so the first load — the one
+        // the effect below fires — rejected unhandled and rendered the empty
+        // state, reading as "no files match" when the request had failed.
+        .catch((err: Error) => {
+          if (!gate.isCurrent(requestId)) return
+          setError(err.message)
+        })
+        .finally(() => {
+          if (!gate.isCurrent(requestId)) return
+          setLoading(false)
+        })
     },
-    [slug, query],
+    [slug, query, gate],
   )
 
   const refresh = React.useCallback(
     (page = 1) => {
       setLoading(true)
       setError(null)
-      return load(page).catch((err: Error) => setError(err.message))
+      return load(page)
     },
     [load],
   )
 
+  // No cleanup needed: when `slug` or `query` changes, this effect re-runs,
+  // which bumps the counter and retires the in-flight request. On unmount React
+  // ignores a setState aimed at a component that is gone.
   React.useEffect(() => {
-    void load(1)
+    void load()
   }, [load])
 
   return (
@@ -210,6 +320,11 @@ const load = React.useCallback(
           <Loader2Icon className="size-4 animate-spin" />
           <span className="text-sm">Loading files…</span>
         </div>
+      ) : files.length === 0 && error ? (
+        // "We could not ask" is not "there is nothing here": showing the empty
+        // state next to a failed request sent people hunting for a filter
+        // problem that did not exist.
+        <p className="px-6 py-6 text-sm text-muted-foreground">Could not load files.</p>
       ) : files.length === 0 ? (
         <EmptyState icon={<FileCode2Icon />}>No files match the filter.</EmptyState>
       ) : (
@@ -261,23 +376,39 @@ function SymbolsTab({ slug }: { slug: string }) {
   const [loading, setLoading] = React.useState(true)
   const [error, setError] = React.useState<string | null>(null)
 
-  const load = React.useCallback(async () => {
-      try {
-        const params = new URLSearchParams({ limit: "200" })
-        if (query) params.set("q", query)
-        if (kind) params.set("kind", kind)
-        const data = await getJson<{ symbols: SymbolDto[] }>(`/api/v1/projects/${slug}/symbols?${params}`)
-        setSymbols(data.symbols)
-        setError(null)
-      } finally {
-        setLoading(false)
-      }
-    }, [slug, query, kind])
+  // Same out-of-order hazard as FilesTab, and the same fix: the name filter is
+  // live per keystroke, so responses can arrive in the reverse order they were
+  // requested and the newest one has to win.
+  const [gate] = React.useState(createRequestGate)
+
+  const load = React.useCallback(() => {
+      const requestId = gate.next()
+      const params = new URLSearchParams({ limit: "200" })
+      if (query) params.set("q", query)
+      if (kind) params.set("kind", kind)
+      return getJson<{ symbols: SymbolDto[] }>(`/api/v1/projects/${slug}/symbols?${params}`)
+        .then((data) => {
+          if (!gate.isCurrent(requestId)) return
+          setSymbols(data.symbols)
+          setError(null)
+        })
+        // Same defect as FilesTab: the first load ran through this callback with
+        // no catch, so a failure produced an unhandled rejection and an empty
+        // state that looked like a genuinely symbol-free project.
+        .catch((err: Error) => {
+          if (!gate.isCurrent(requestId)) return
+          setError(err.message)
+        })
+        .finally(() => {
+          if (!gate.isCurrent(requestId)) return
+          setLoading(false)
+        })
+    }, [slug, query, kind, gate])
 
   const refresh = React.useCallback(() => {
     setLoading(true)
     setError(null)
-    return load().catch((err: Error) => setError(err.message))
+    return load()
   }, [load])
 
   React.useEffect(() => {
@@ -305,8 +436,12 @@ function SymbolsTab({ slug }: { slug: string }) {
           <Select
             value={kind || null}
             onValueChange={(value) => {
+              // `setKind` alone is enough: `load` closes over `kind`, so the
+              // new value gives `load` a new identity and the effect that
+              // loads symbols refires with it. Calling `refresh()` here as
+              // well issued a second request carrying the *previous* kind,
+              // because that render's `refresh` had not seen the update yet.
               setKind(value ?? "")
-              void refresh()
             }}
           >
             <SelectTrigger className="w-32!">
@@ -334,6 +469,8 @@ function SymbolsTab({ slug }: { slug: string }) {
           <Loader2Icon className="size-4 animate-spin" />
           <span className="text-sm">Loading symbols…</span>
         </div>
+      ) : symbols.length === 0 && error ? (
+        <p className="px-6 py-6 text-sm text-muted-foreground">Could not load symbols.</p>
       ) : symbols.length === 0 ? (
         <EmptyState icon={<BracesIcon />}>No symbols match the filter.</EmptyState>
       ) : (
@@ -496,15 +633,22 @@ function SearchTab({ slug }: { slug: string }) {
 function JobsTab({ slug }: { slug: string }) {
   const [jobs, setJobs] = React.useState<JobDto[]>([])
   const [loading, setLoading] = React.useState(true)
+  const [error, setError] = React.useState<string | null>(null)
 
-  const load = React.useCallback(async () => {
-    try {
-      const data = await getJson<{ jobs: JobDto[] }>(`/api/v1/jobs?project=${slug}&limit=50`)
-      setJobs(data.jobs)
-    } finally {
-      setLoading(false)
-    }
-  }, [slug])
+  // The catch here used to be missing, so the 5s interval produced an unhandled
+  // rejection on every tick, and the render below fell through to "No jobs for
+  // this project" — a failed request presented as a project with no history.
+  const load = React.useCallback(
+    () =>
+      getJson<{ jobs: JobDto[] }>(`/api/v1/jobs?project=${slug}&limit=50`)
+        .then((data) => {
+          setJobs(data.jobs)
+          setError(null)
+        })
+        .catch((err: Error) => setError(err.message))
+        .finally(() => setLoading(false)),
+    [slug],
+  )
 
   React.useEffect(() => {
     void load()
@@ -528,11 +672,28 @@ function JobsTab({ slug }: { slug: string }) {
 
   return (
     <PanelCard title="Jobs" description="Polling every 5 seconds.">
-      {loading ? (
+      {/* The message is rendered above the branches below on purpose: gating it
+          on `jobs.length === 0` meant a poll that failed after the table had
+          loaded left the stale rows on screen with nothing saying live updates
+          had stopped. */}
+      {error && (
+        <Alert variant="destructive" className="mx-3!">
+          <TriangleAlertIcon />
+          <AlertTitle>Live updates are failing</AlertTitle>
+          <AlertDescription>
+            {error} Polling retries every 5 seconds; anything below is the last data that loaded.
+          </AlertDescription>
+        </Alert>
+      )}
+      {loading && jobs.length === 0 ? (
         <div className="flex items-center gap-2 py-8 text-muted-foreground">
           <Loader2Icon className="size-4 animate-spin" />
           <span className="text-sm">Loading jobs…</span>
         </div>
+      ) : jobs.length === 0 && error ? (
+        <p className="px-6 py-6 text-sm text-muted-foreground">
+          This usually means the session expired. Reload to sign in again.
+        </p>
       ) : jobs.length === 0 ? (
         <EmptyState icon={<CircleXIcon />}>No jobs for this project.</EmptyState>
       ) : (
@@ -590,21 +751,78 @@ function JobsTab({ slug }: { slug: string }) {
 }
 
 
+/**
+ * Which secret actually verifies this project's deliveries.
+ *
+ * `webhookSecretFor()` on the server prefers the process-wide
+ * GITHUB_WEBHOOK_SECRET over the per-project secret, but the settings endpoint
+ * always returns the per-project one. An operator told to configure "this
+ * secret" in GitHub therefore wrote a secret that every delivery would then be
+ * rejected against — and the rejections look like a broken GitHub hook. The
+ * dashboard says which of the two is in force instead of showing a value that
+ * may be irrelevant.
+ */
+export type WebhookSecretSource = "project" | "global"
+
 function SettingsTab({
   slug,
   embedding,
   indexStatus,
+  indexStatusError,
   webhook,
+  webhookSecretSource,
 }: {
   slug: string
   embedding: { provider: string | null; model: string | null; apiUrl: string | null; dimensions: number | null; batchSize: number | null }
-  indexStatus: IndexStatus
+  indexStatus: IndexStatus | null
+  indexStatusError: string | null
   webhook: WebhookInfo
+  webhookSecretSource: WebhookSecretSource
 }) {
   const router = useRouter()
   const [busy, setBusy] = React.useState(false)
   const [showSecret, setShowSecret] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
+  const [notice, setNotice] = React.useState<string | null>(null)
+  const [clearOpen, setClearOpen] = React.useState(false)
+  // The fields are uncontrolled (`defaultValue`), so a refresh that changes the
+  // server's copy of a value does not necessarily change what is on screen:
+  // once the operator has typed in an input, the browser keeps the typed value
+  // and ignores the new default. After a successful write the form is remounted
+  // so it shows what the server actually stored — otherwise "overrides
+  // removed" leaves the old model sitting in the box, which is the one thing
+  // the operator would not believe.
+  const [formVersion, setFormVersion] = React.useState(0)
+
+  const patchEmbedding = async (body: Record<string, unknown>, successMessage: string): Promise<boolean> => {
+    setBusy(true)
+    setError(null)
+    // try/finally: a transport failure rejects the fetch, and without this the
+    // Save button stayed disabled and spinning with nothing on screen.
+    try {
+      const res = await fetch(`/api/v1/projects/${slug}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ embedding: body }),
+      })
+      if (!res.ok) {
+        // The 400 carries the offending field in `details`; without it the
+        // operator is told only that "validation failed" and retries the same
+        // payload.
+        setError(apiErrorMessage(await res.json().catch(() => null), res.status, "Could not save settings."))
+        return false
+      }
+      setFormVersion((version) => version + 1)
+      toast.success(successMessage)
+      router.refresh()
+      return true
+    } catch (err) {
+      setError(`Could not save settings: ${(err as Error).message}`)
+      return false
+    } finally {
+      setBusy(false)
+    }
+  }
 
   const saveEmbedding = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -616,6 +834,10 @@ function SettingsTab({
     const model = (form.get("model") as string | undefined)?.trim()
     const dimensions = (form.get("dimensions") as string | undefined)?.trim()
     const batchSize = (form.get("batchSize") as string | undefined)?.trim()
+    // A blank field is "leave this override alone", never "remove it": the two
+    // are different requests to the API and conflating them is what made the
+    // override impossible to remove — the key was simply never sent, so the
+    // saved value came back unchanged and the save read as if it had worked.
     if (provider) embeddingBody.provider = provider
     if (apiUrl) embeddingBody.apiUrl = apiUrl
     if (apiKey) embeddingBody.apiKey = apiKey
@@ -623,21 +845,47 @@ function SettingsTab({
     if (dimensions) embeddingBody.dimensions = Number(dimensions)
     if (batchSize) embeddingBody.batchSize = Number(batchSize)
 
-    setBusy(true)
-    setError(null)
-    const res = await fetch(`/api/v1/projects/${slug}`, {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ embedding: embeddingBody }),
-    })
-    if (!res.ok) {
-      const json = await res.json().catch(() => null)
-      setError((json as { error?: { message?: string } })?.error?.message ?? "Could not save settings.")
-    } else {
-      toast.success("Embedding settings saved.")
-      router.refresh()
+    if (Object.keys(embeddingBody).length === 0) {
+      // Sending an empty object here answered 200 and changed nothing, so the
+      // operator was told the settings were saved.
+      setError(
+        "Nothing to save: every field is blank. A blank field leaves the current override unchanged — to fall back to the system defaults, use “Remove all overrides”.",
+      )
+      return
     }
-    setBusy(false)
+
+    // Fields that had an override and were left blank are the trap this form is
+    // built around: the save succeeds, the override survives, and nothing on
+    // screen says so. Name them.
+    const kept: string[] = []
+    if (embedding.provider && !provider) kept.push("provider")
+    if (embedding.apiUrl && !apiUrl) kept.push("API URL")
+    if (embedding.model && !model) kept.push("model")
+    if (embedding.dimensions !== null && !dimensions) kept.push("dimensions")
+    if (embedding.batchSize !== null && !batchSize) kept.push("batch size")
+
+    if (!(await patchEmbedding(embeddingBody, "Embedding settings saved."))) return
+    setNotice(
+      kept.length > 0
+        ? `Left blank, so the stored override was kept: ${kept.join(", ")}. A blank field never removes a value — use “Remove all overrides” for that.`
+        : null,
+    )
+  }
+
+  /**
+   * Removal is an explicit request: every override key is sent as `null`,
+   * which the API distinguishes from "absent" (leave unchanged) and from a
+   * value (set). The stored API key goes too — it is the one field this form
+   * can never show back, so it has no other way to be replaced.
+   */
+  const clearEmbedding = async () => {
+    if (await patchEmbedding(CLEARED_EMBEDDING_OVERRIDES, "All per-project embedding overrides removed. This project now uses the system defaults.")) {
+      setNotice(null)
+      // Close on success only: a failure leaves the dialog open with the error
+      // visible next to the button that caused it, instead of dismissing the
+      // thing the operator needs to read.
+      setClearOpen(false)
+    }
   }
 
   const onDelete = async () => {
@@ -652,14 +900,24 @@ function SettingsTab({
 
   return (
     <div className="flex flex-col gap-6">
-      <PanelCard title="Embedding configuration" description="Per-project overrides; blank fields fall back to system defaults.">
+      <PanelCard
+        title="Embedding configuration"
+        description="Per-project overrides of the system defaults. A blank field leaves the stored override unchanged; “Remove all overrides” clears them and falls back to the system defaults."
+      >
         <form
+          key={formVersion}
           onSubmit={saveEmbedding}
           className="flex flex-col gap-3 px-3! py-3!"
         >
           {error && (
             <Alert variant="destructive">
               <AlertDescription>{error}</AlertDescription>
+            </Alert>
+          )}
+          {notice && (
+            <Alert>
+              <CircleCheckIcon />
+              <AlertDescription>{notice}</AlertDescription>
             </Alert>
           )}
           <div className="grid gap-3 sm:grid-cols-2">
@@ -689,19 +947,74 @@ function SettingsTab({
             </div>
           </div>
           <div className="text-xs text-muted-foreground">
-            Current model: <span className="font-mono">{indexStatus.embeddingModel ?? "system default"}</span>
-            {indexStatus.embeddingDimensions ? ` · ${indexStatus.embeddingDimensions}d` : ""}
-            {indexStatus.embeddingVersion ? ` · version ${indexStatus.embeddingVersion}` : ""}
+            {/* The configured override and the model the index was actually built
+                with are different things. On an unreadable index status the
+                latter is unknown, and naming the configured value here (or
+                "system default") would state as fact something nobody confirmed. */}
+            {indexStatus === null ? (
+              <>Index status unreadable — the model this index was built with is unknown{indexStatusError ? `: ${indexStatusError}` : "."}</>
+            ) : (
+              <>
+                Current model: <span className="font-mono">{indexStatus.embeddingModel ?? "system default"}</span>
+                {indexStatus.embeddingDimensions ? ` · ${indexStatus.embeddingDimensions}d` : ""}
+                {indexStatus.embeddingVersion ? ` · version ${indexStatus.embeddingVersion}` : ""}
+              </>
+            )}
           </div>
-          <Button type="submit" disabled={busy}>
-            {busy && <Loader2Icon className="size-4 animate-spin" />}
-            Save settings
-          </Button>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button type="submit" disabled={busy}>
+              {busy && <Loader2Icon className="size-4 animate-spin" />}
+              Save settings
+            </Button>
+            <Dialog open={clearOpen} onOpenChange={setClearOpen}>
+              <DialogTrigger render={<Button variant="outline" />}>
+                <Trash2Icon />
+                Remove all overrides
+              </DialogTrigger>
+              <DialogContent>
+                <DialogHeader>
+                  <DialogTitle>Remove every embedding override?</DialogTitle>
+                  <DialogDescription>
+                    This project falls back to the system-wide embedding defaults
+                    {embedding.model || embedding.dimensions ? (
+                      <>
+                        {" "}— its configured model
+                        {embedding.model ? ` (${embedding.model})` : ""}
+                        {embedding.dimensions ? ` at ${embedding.dimensions}d` : ""} will no longer apply
+                      </>
+                    ) : null}
+                    . The stored API key is removed too. If the effective model or dimensionality ends up different
+                    from the one this index was built with, every existing vector becomes unusable until a re-embed job
+                    refills the collection.
+                  </DialogDescription>
+                </DialogHeader>
+                <DialogFooter showCloseButton>
+                  <Button variant="destructive" disabled={busy} onClick={() => void clearEmbedding()}>
+                    {busy && <Loader2Icon className="size-4 animate-spin" />}
+                    Remove overrides
+                  </Button>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
+          </div>
         </form>
       </PanelCard>
 
       <PanelCard title="Webhook" description="GitHub push events keep this repository in sync.">
         <div className="flex flex-col gap-3 px-3! py-3!">
+          {webhookSecretSource === "global" && (
+            <Alert variant="destructive">
+              <TriangleAlertIcon />
+              <AlertTitle>The secret below is not verifying deliveries</AlertTitle>
+              <AlertDescription>
+                GITHUB_WEBHOOK_SECRET is set on the server and takes precedence, so every push is verified against that
+                process-wide secret. Configuring this repository with the per-project secret shown here will make every
+                delivery fail with a signature mismatch. Either configure the webhook with the GITHUB_WEBHOOK_SECRET
+                value, or unset it to verify per project. The global value is deliberately not displayed here — it
+                authorises delivery for every project on this instance.
+              </AlertDescription>
+            </Alert>
+          )}
           <div className="flex flex-col gap-1.5">
             <Label htmlFor="webhook-url">Endpoint URL</Label>
             <div className="flex items-center gap-2">
@@ -709,7 +1022,7 @@ function SettingsTab({
               <Button
                 size="icon-sm"
                 variant="ghost"
-                onClick={() => void navigator.clipboard.writeText(webhook.url).then(() => toast.success("URL copied."))}
+                onClick={() => void copyToClipboard(webhook.url, "URL")}
                 title="Copy URL"
               >
                 <CopyIcon />
@@ -717,7 +1030,10 @@ function SettingsTab({
             </div>
           </div>
           <div className="flex flex-col gap-1.5">
-            <Label htmlFor="webhook-secret">Secret</Label>
+            <Label htmlFor="webhook-secret">
+              Secret
+              {webhookSecretSource === "global" ? " (not in force)" : ""}
+            </Label>
             <div className="flex items-center gap-2">
               <Input
                 id="webhook-secret"
@@ -732,7 +1048,7 @@ function SettingsTab({
               <Button
                 size="icon-sm"
                 variant="ghost"
-                onClick={() => void navigator.clipboard.writeText(webhook.secret).then(() => toast.success("Secret copied."))}
+                onClick={() => void copyToClipboard(webhook.secret, "Secret")}
                 title="Copy secret"
               >
                 <CopyIcon />
@@ -775,18 +1091,245 @@ function SettingsTab({
 }
 
 
+function CommitsTab({ slug }: { slug: string }) {
+  const [data, setData] = React.useState<CommitsResponse | null>(null)
+  const [loading, setLoading] = React.useState(true)
+  const [error, setError] = React.useState<string | null>(null)
+
+  const url = `/api/v1/projects/${slug}/commits?limit=50`
+
+  // The initial fetch is inlined in the effect with every setState inside a
+  // promise callback, and the `active` guard drops results that arrive after
+  // the slug changes or the tab unmounts. `load` is the manual-refresh path.
+  const load = React.useCallback(
+    () =>
+      getJson<CommitsResponse>(url)
+        .then((d) => {
+          setData(d)
+          setError(null)
+        })
+        .finally(() => setLoading(false)),
+    [url],
+  )
+
+  React.useEffect(() => {
+    let active = true
+    getJson<CommitsResponse>(url)
+      .then((d) => {
+        if (!active) return
+        setData(d)
+        setError(null)
+      })
+      .catch((err: Error) => {
+        if (active) setError(err.message)
+      })
+      .finally(() => {
+        if (active) setLoading(false)
+      })
+    return () => {
+      active = false
+    }
+  }, [url])
+
+  const commits = data?.commits ?? []
+
+  return (
+    <PanelCard
+      title="Commits"
+      description={
+        data?.repository?.lastKnownCommit
+          ? `branch ${data.repository.branch} · head ${data.repository.lastKnownCommit.slice(0, 8)}`
+          : "History recorded during indexing"
+      }
+      action={
+        <Button variant="outline" size="sm" onClick={() => { setLoading(true); void load().catch((err: Error) => setError(err.message)) }} disabled={loading}>
+          {loading ? "Loading…" : "Refresh"}
+        </Button>
+      }
+    >
+      {error ? (
+        <p className="px-6 py-6 text-sm text-destructive">{error}</p>
+      ) : loading ? (
+        <p className="px-6 py-6 text-sm text-muted-foreground">Loading commits…</p>
+      ) : commits.length === 0 ? (
+        <EmptyState icon={<GitCommitHorizontalIcon className="size-6" />}>
+          No commits recorded yet. They are captured on the next sync.
+        </EmptyState>
+      ) : (
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead className="w-28">Commit</TableHead>
+              <TableHead>Subject</TableHead>
+              <TableHead className="w-40">Author</TableHead>
+              <TableHead className="w-36 text-right">When</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {commits.map((c) => (
+              <TableRow key={c.sha}>
+                <TableCell className="font-mono text-xs text-muted-foreground">{c.shortSha}</TableCell>
+                <TableCell className="max-w-0 truncate" title={c.subject}>
+                  {c.subject}
+                </TableCell>
+                <TableCell className="truncate text-sm text-muted-foreground">{c.author}</TableCell>
+                <TableCell className="text-right text-sm text-muted-foreground">
+                  {formatRelative(c.authoredAt)}
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      )}
+    </PanelCard>
+  )
+}
+
+function RetrievalTab({ slug }: { slug: string }) {
+  const [data, setData] = React.useState<EvalsResponse | null>(null)
+  const [loading, setLoading] = React.useState(true)
+  const [error, setError] = React.useState<string | null>(null)
+
+  const url = `/api/v1/projects/${slug}/evals`
+
+  const load = React.useCallback(
+    () =>
+      getJson<EvalsResponse>(url)
+        .then((d) => {
+          setData(d)
+          setError(null)
+        })
+        .finally(() => setLoading(false)),
+    [url],
+  )
+
+  React.useEffect(() => {
+    let active = true
+    getJson<EvalsResponse>(url)
+      .then((d) => {
+        if (!active) return
+        setData(d)
+        setError(null)
+      })
+      .catch((err: Error) => {
+        if (active) setError(err.message)
+      })
+      .finally(() => {
+        if (active) setLoading(false)
+      })
+    return () => {
+      active = false
+    }
+  }, [url])
+
+  const agg = data?.aggregate
+  const questions = data?.questions ?? []
+
+  return (
+    <div className="flex flex-col gap-4">
+      <PanelCard
+        title="Retrieval quality"
+        description="Recall of this project's index over its own eval questions, scored live with the same metric as `npm run eval`."
+        action={
+          <Button variant="outline" size="sm" onClick={() => { setLoading(true); void load().catch((err: Error) => setError(err.message)) }} disabled={loading}>
+            {loading ? "Scoring…" : "Re-score"}
+          </Button>
+        }
+      >
+        {error ? (
+          <p className="px-6 py-6 text-sm text-destructive">{error}</p>
+        ) : loading ? (
+          <p className="px-6 py-6 text-sm text-muted-foreground">Running the project&apos;s questions…</p>
+        ) : questions.length === 0 ? (
+          <EmptyState icon={<TargetIcon className="size-6" />}>
+            No eval questions yet. Add one with POST /api/v1/projects/{slug}/evals to start tracking whether this
+            index actually finds the right code.
+          </EmptyState>
+        ) : (
+          <>
+            <div className="flex flex-wrap gap-6 border-b px-6 py-4">
+              <div>
+                <p className="text-xs text-muted-foreground">recall@5</p>
+                <p className="text-2xl font-semibold tabular-nums">{formatScore(agg?.recallFilesAt5)}</p>
+              </div>
+              <div>
+                <p className="text-xs text-muted-foreground">recall@10</p>
+                <p className="text-2xl font-semibold tabular-nums">{formatScore(agg?.recallFilesAt10)}</p>
+              </div>
+              <div>
+                <p className="text-xs text-muted-foreground">questions</p>
+                <p className="text-2xl font-semibold tabular-nums">{agg?.questions ?? 0}</p>
+              </div>
+              {agg && agg.failed > 0 && (
+                <div>
+                  <p className="text-xs text-muted-foreground">failed</p>
+                  <p className="text-2xl font-semibold tabular-nums text-destructive">{agg.failed}</p>
+                </div>
+              )}
+            </div>
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Question</TableHead>
+                  <TableHead>Expected</TableHead>
+                  <TableHead className="w-24 text-right">@5</TableHead>
+                  <TableHead className="w-24 text-right">@10</TableHead>
+                  <TableHead>Top result</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {questions.map((q) => (
+                  <TableRow key={q.id}>
+                    <TableCell className="max-w-0 truncate" title={q.query}>
+                      {q.query}
+                    </TableCell>
+                    <TableCell className="max-w-0 truncate font-mono text-xs text-muted-foreground">
+                      {q.expectedFiles.join(", ")}
+                    </TableCell>
+                    <TableCell className="text-right tabular-nums">{formatScore(q.recallFiles[5])}</TableCell>
+                    <TableCell className="text-right tabular-nums">{formatScore(q.recallFiles[10])}</TableCell>
+                    <TableCell className="max-w-0 truncate font-mono text-xs text-muted-foreground">
+                      {q.error ? <span className="text-destructive">{q.error}</span> : (q.topFiles[0] ?? "—")}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+            {data?.truncated ? (
+              <p className="border-t px-6 py-3 text-xs text-muted-foreground">
+                {data.truncated} question(s) were not scored; only the first 50 are run per request.
+              </p>
+            ) : null}
+          </>
+        )}
+      </PanelCard>
+    </div>
+  )
+}
+
+function formatScore(value: number | null | undefined): string {
+  return value === null || value === undefined ? "—" : value.toFixed(2)
+}
+
 export function ProjectTabs({
   slug,
   stats,
   indexStatus,
+  indexStatusError,
   recentJobs,
   webhook,
+  webhookSecretSource,
+  embedding,
 }: {
   slug: string
   stats: ProjectStats
-  indexStatus: IndexStatus
+  /** null when the index-status read failed; see `indexStatusError`. */
+  indexStatus: IndexStatus | null
+  indexStatusError: string | null
   recentJobs: JobDto[]
   webhook: WebhookInfo
+  webhookSecretSource: WebhookSecretSource
+  embedding: { provider: string | null; model: string | null; apiUrl: string | null; dimensions: number | null; batchSize: number | null }
 }) {
   return (
     <Tabs defaultValue="overview">
@@ -796,10 +1339,17 @@ export function ProjectTabs({
         <TabsTrigger value="symbols">Symbols</TabsTrigger>
         <TabsTrigger value="search">Search</TabsTrigger>
         <TabsTrigger value="jobs">Jobs</TabsTrigger>
+        <TabsTrigger value="commits">Commits</TabsTrigger>
+        <TabsTrigger value="retrieval">Retrieval</TabsTrigger>
         <TabsTrigger value="settings">Settings</TabsTrigger>
       </TabsList>
       <TabsContent value="overview">
-        <OverviewTab stats={stats} indexStatus={indexStatus} recentJobs={recentJobs} />
+        <OverviewTab
+          stats={stats}
+          indexStatus={indexStatus}
+          indexStatusError={indexStatusError}
+          recentJobs={recentJobs}
+        />
       </TabsContent>
       <TabsContent value="files">
         <FilesTab slug={slug} />
@@ -813,12 +1363,20 @@ export function ProjectTabs({
       <TabsContent value="jobs">
         <JobsTab slug={slug} />
       </TabsContent>
+      <TabsContent value="commits">
+        <CommitsTab slug={slug} />
+      </TabsContent>
+      <TabsContent value="retrieval">
+        <RetrievalTab slug={slug} />
+      </TabsContent>
       <TabsContent value="settings">
         <SettingsTab
           slug={slug}
-          embedding={{ provider: null, model: null, apiUrl: null, dimensions: null, batchSize: null }}
+          embedding={embedding}
           indexStatus={indexStatus}
+          indexStatusError={indexStatusError}
           webhook={webhook}
+          webhookSecretSource={webhookSecretSource}
         />
       </TabsContent>
     </Tabs>

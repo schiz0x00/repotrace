@@ -11,6 +11,7 @@ import { Progress, ProgressValue } from "@/components/ui/progress"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { jobTypeLabel } from "@/components/dashboard/jobs-table"
 import { postAction } from "@/components/dashboard/project-actions"
+import { createRequestGate } from "@/components/dashboard/dashboard-helpers"
 import {
   ListTodoIcon,
   Loader2Icon,
@@ -26,6 +27,14 @@ async function getJobs(status: string): Promise<{ jobs: JobDto[] }> {
   const params = new URLSearchParams({ limit: "100" })
   if (status) params.set("status", status)
   const res = await fetch(`/api/v1/jobs?${params}`)
+  // The response was cast straight to the success shape without checking
+  // res.ok, so a 401 or 500 set `jobs` to undefined and the render threw —
+  // and because the page polls every 5 seconds, it threw again immediately,
+  // forever. An expired session looked like a permanently broken page.
+  if (!res.ok) {
+    const body = (await res.json().catch(() => null)) as { error?: { message?: string } } | null
+    throw new Error(body?.error?.message ?? `Could not load jobs (HTTP ${res.status})`)
+  }
   return res.json() as Promise<{ jobs: JobDto[] }>
 }
 
@@ -33,14 +42,42 @@ export default function JobsPage() {
   const [status, setStatus] = React.useState("")
   const [jobs, setJobs] = React.useState<JobDto[]>([])
   const [loading, setLoading] = React.useState(true)
+  const [error, setError] = React.useState<string | null>(null)
 
-  const load = React.useCallback(async () => {
-    try {
-      setJobs((await getJobs(status)).jobs)
-    } finally {
-      setLoading(false)
-    }
-  }, [status])
+  // Generation counter for the poll. Changing the filter swaps `status` and
+  // re-keys `load`, but the request the previous filter started is still in
+  // flight, and so is the 5s tick that fired just before the change. Responses
+  // are not ordered: a slow `?status=` request for the old filter can land
+  // after a fast one for the new filter and repopulate the table with jobs the
+  // operator just filtered out — a table that looks right for a filter that is
+  // no longer selected. Each request takes a ticket; only the newest ticket may
+  // write state.
+  const [gate] = React.useState(createRequestGate)
+
+  // `load` never calls setState synchronously: everything happens in the
+  // promise callbacks, so polling this every 5 seconds cannot cascade a
+  // render on the tick itself.
+  const load = React.useCallback(
+    () => {
+      const requestId = gate.next()
+      return getJobs(status)
+        .then((data) => {
+          if (!gate.isCurrent(requestId)) return
+          setJobs(data.jobs)
+          setError(null)
+        })
+        .catch((err: Error) => {
+          // Swallowed here it became an unhandled rejection on every poll tick.
+          if (!gate.isCurrent(requestId)) return
+          setError(err.message)
+        })
+        .finally(() => {
+          if (!gate.isCurrent(requestId)) return
+          setLoading(false)
+        })
+    },
+    [status, gate],
+  )
 
   React.useEffect(() => {
     void load()
@@ -97,13 +134,37 @@ export default function JobsPage() {
               <Loader2Icon className="size-4 animate-spin" />
               <span className="text-sm">Loading jobs…</span>
             </div>
+          ) : jobs.length === 0 && error ? (
+            // Nothing loaded AND the load failed: this is the only case where
+            // the table has nothing to show. Once a poll has succeeded, a later
+            // failure must not blank a working table -- the jobs are real, they
+            // are just not being refreshed, and replacing them with an error
+            // told the operator their job history had vanished.
+            <div className="flex flex-col items-center gap-2 px-6 py-10 text-center">
+              <OctagonXIcon className="size-6 text-destructive" />
+              <p className="text-sm text-destructive">{error}</p>
+              <p className="text-sm text-muted-foreground">
+                The job list could not be loaded. Reload to try again.
+              </p>
+            </div>
           ) : jobs.length === 0 ? (
             <div className="flex flex-col items-center gap-2 py-10 text-muted-foreground">
               <ListTodoIcon className="size-6" />
               <p className="text-sm">No jobs{status ? ` with status "${status}"` : ""}.</p>
             </div>
           ) : (
-            <Table>
+            <React.Fragment>
+          {error && (
+            // A stale-but-real table plus a visible warning beats either
+            // pretending the data is current or throwing it away.
+            <div className="flex items-center gap-2 border-b px-6 py-2 text-sm text-destructive">
+              <OctagonXIcon className="size-4 shrink-0" />
+              <span>
+                Showing the last successful load. Refreshing failed: {error}
+              </span>
+            </div>
+          )}
+          <Table>
               <TableHeader>
                 <TableRow>
                   <TableHead>Job</TableHead>
@@ -171,6 +232,7 @@ export default function JobsPage() {
                 ))}
               </TableBody>
             </Table>
+          </React.Fragment>
           )}
         </CardContent>
       </Card>

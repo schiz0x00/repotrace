@@ -204,6 +204,9 @@ model File {
 
   @@unique([repositoryId, path])
   @@index([projectId])
+  // Backs GET /files, which pages one project ordered by path. The index above
+  // covers the filter but not the sort.
+  @@index([projectId, path])
   @@map("file")
 }
 
@@ -221,6 +224,10 @@ model Symbol {
   endLine       Int
   parentName    String?
   metadata      Json? // { calls: string[], imports: string[], implements: string[], extends: string[], doc: string? }
+  // Generated tsvector column added by migration 20260920000000_lexical_search.
+  // See the note on Chunk.contentTsv: the companion GIN index
+  // "symbol_name_tsv_idx" cannot be expressed in the Prisma schema either.
+  nameTsv       Unsupported("tsvector")?
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 
@@ -229,6 +236,13 @@ model Symbol {
   @@index([projectId, qualifiedName])
   @@index([projectId, name])
   @@index([fileId])
+  // NOTE: migration 20260920000000_lexical_search also creates
+  // "symbol_qualified_name_prefix_idx" ON "symbol" ("qualifiedName" text_pattern_ops).
+  // Prisma cannot express text_pattern_ops without the `extendedIndexes` preview
+  // feature, so it is intentionally absent here. `prisma migrate deploy` (the
+  // production path) only applies pending migrations and never drops anything,
+  // but `prisma migrate dev` would generate a DROP for it — re-create the index
+  // from the migration if you regenerate migrations.
   @@map("symbol")
 }
 
@@ -249,11 +263,27 @@ model Chunk {
   embeddingVersion Int?
   status           ChunkStatus @default(pending)
   error            String?
+  // Generated tsvector column added by migration 20260920000000_lexical_search.
+  // Declared here so `prisma migrate dev` does not try to drop the column.
+  //
+  // That same migration also creates "chunk_content_tsv_idx", a GIN index on
+  // this column. Prisma cannot express a GIN index (or text_pattern_ops) in
+  // the schema, so it is invisible here in both directions: `prisma migrate
+  // deploy` -- the production path -- only applies pending migrations and never
+  // drops anything, so the index survives. But `prisma migrate dev` diffs the
+  // schema against the live database and WILL generate a DROP INDEX for it,
+  // because the index exists in the database but not in the schema. If you
+  // regenerate migrations, re-create both indexes from the migration file.
+  contentTsv       Unsupported("tsvector")?
   createdAt        DateTime   @default(now())
   updatedAt        DateTime   @updatedAt
 
   @@unique([fileId, contentHash, startLine])
   @@index([projectId])
+  // Foreign key with ON DELETE CASCADE. Without this, deleting a file's
+  // symbols made Postgres sequentially scan the whole chunk table to find the
+  // rows to cascade — the dominant cost of re-indexing a single file.
+  @@index([symbolId])
   @@map("chunk")
 }
 
@@ -267,6 +297,22 @@ model Commit {
   authoredAt   DateTime
 
   @@unique([repositoryId, sha])
+  // Backs the commit history listing — GET /api/v1/projects/:idOrSlug/commits
+  // and the MCP `list_commits` tool both read one repository with
+  // `WHERE repositoryId = $1 [AND <keyset cursor>] ORDER BY authoredAt DESC,
+  // sha DESC LIMIT n`. The unique index above filters on repositoryId and
+  // orders by sha within that repository, but authoredAt is not in it at all,
+  // so it cannot supply the order: every page — including the first — sorted
+  // the repository's entire recorded history before the top `n` were taken.
+  // The history is uncapped by design (recordTipCommit in the indexing
+  // pipeline), so that sort is not small.
+  //
+  // ASC is what the index stores, deliberately. A backward scan of this btree
+  // yields exactly (authoredAt DESC, sha DESC), so no DESC column order is
+  // needed — and the same index also serves the ASC reading.
+  //
+  // Created by migration 20260929000000_commits_index.
+  @@index([repositoryId, authoredAt, sha])
   @@map("commit")
 }
 
@@ -287,6 +333,10 @@ model Job {
   updatedAt   DateTime  @updatedAt
 
   @@index([projectId, createdAt])
+  // The dashboard and the orphan reaper filter by status alone
+  // (`status = 'queued'`, `status IN ('queued','running')`). The index above
+  // leads with projectId and is unusable for those queries.
+  @@index([status, createdAt])
   @@map("job")
 }
 
@@ -328,6 +378,10 @@ model MetricEvent {
 
   @@index([name, recordedAt])
   @@index([projectId, recordedAt])
+  // pruneMetrics deletes rows older than a cutoff with no other predicate, and
+  // the hourly retention sweep runs it against the whole table. Neither index
+  // above leads with recordedAt.
+  @@index([recordedAt])
   @@map("metric_event")
 }
 

@@ -1,0 +1,30 @@
+-- Index gap found in the September 2026 audit: the commit history listing.
+--
+-- GET /api/v1/projects/:idOrSlug/commits and the MCP `list_commits` tool both
+-- run, in src/app/api/v1/projects/[idOrSlug]/commits/route.ts and
+-- src/lib/mcp/server.ts:
+--
+--   SELECT ... FROM "commit"
+--   WHERE "repositoryId" = $1 [AND (<keyset cursor clause>)]
+--   ORDER BY "authoredAt" DESC, "sha" DESC
+--   LIMIT $2
+--
+-- The only index `commit` had was commit_repositoryId_sha_key, which leads
+-- with repositoryId and then sorts by sha. It filters correctly and supplies
+-- the wrong order, so Postgres read the repository's whole recorded history and
+-- sorted it on every page — including the first. (The history is uncapped by
+-- design: a first sync of a long-dormant repository records tens of thousands
+-- of commits, see recordTipCommit/commitRange in src/lib/indexing/pipeline.ts.)
+--
+-- Additive and idempotent, so `prisma migrate deploy` is safe to apply to a
+-- live database: no column is dropped or rewritten and a re-run is a no-op.
+--
+-- CREATE INDEX takes a SHARE lock on the table for the length of the build,
+-- which blocks writes to `commit` but not reads or anything else in the
+-- database. `commit` is written only by the indexing pipeline, so the window
+-- is short in normal operation. CREATE INDEX CONCURRENTLY is deliberately not
+-- used: it cannot run inside a transaction block, and Prisma Migrate applies
+-- each PostgreSQL migration inside a transaction, so it would abort the whole
+-- deploy rather than build the index in the background.
+CREATE INDEX IF NOT EXISTS "commit_repositoryId_authoredAt_sha_idx"
+  ON "commit" ("repositoryId", "authoredAt", "sha");

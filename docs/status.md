@@ -1,6 +1,38 @@
 # Spec status audit
 
-Audit of `docs/spec.md` (V1) against the codebase as of 2026-09-20. Status: `done` / `partial` / `missing`, with the implementation location and notable deviations. Line numbers refer to the current working tree.
+Audit of `docs/spec.md` (V1) against the codebase as of 2026-09-20. Status: `done` / `partial` / `missing`, with the implementation location and notable deviations. References are to functions and columns rather than line numbers, which drift on every change to the file.
+
+> **Historical snapshot — do not read the tables below as current.**
+> This audit was taken on 2026-09-20 and has not been re-run. The following rows
+> are known to be wrong as of 2026-09-28; they are left in place so the record of
+> the 2026-09-20 state survives, not because they are accurate.
+>
+> - **Dashboard is mid-construction** — false. Search, Projects, per-project
+>   detail (overview / files / symbols / search / jobs / commits / retrieval /
+>   settings), Jobs, Embeddings, System Health and Settings pages all exist under
+>   `src/app/(dashboard)/`.
+> - **No automated tests** — false. `tests/` holds a hermetic unit suite
+>   (parser, languages, grammars, auth, projects, webhooks, api-keys, encryption,
+>   git-sync, path traversal, security fixes, eval recall) plus
+>   `tests/integration/`, which runs only under `RUN_INTEGRATION=1`.
+> - **Health endpoint requires auth** — false. `GET /api/v1/health` is public and
+>   is what the compose healthcheck uses. The authenticated diagnostic view was
+>   split out to `GET /api/v1/health/status`.
+> - **MCP tool list** — incomplete as written. Four tools have since been added:
+>   `get_file_outline`, `get_file_range`, `get_dependency_graph`, `list_commits`.
+> - **`eval_question` table is unused** — false. The eval API and the project
+>   page's Retrieval tab read and write it via `/api/v1/projects/:idOrSlug/evals`.
+> - **No Health page / Embeddings page** — false; both exist.
+>
+> The gaps that were real have since been closed: multi-word lexical search
+> (terms were ANDed, so natural-language queries matched nothing), parse
+> failures (unguarded, so one bad file aborted the whole job) — and the reason
+> for a parse fallback is now recorded on the file instead of dropped, per-job
+> telemetry (the `IndexResult` counts are now written to `job.metadata`),
+> `implements` (dropped at persist time; now extracted, stored and exposed), and
+> the `findReferences` 500-symbol scan cap (now a single indexed jsonb query).
+> The live README describes the system as it is now. Rows corrected after the
+> 2026-09-20 snapshot are marked **Corrected 2026-09-28**.
 
 ## Core architecture & technology (spec §2, §3)
 
@@ -15,7 +47,7 @@ Audit of `docs/spec.md` (V1) against the codebase as of 2026-09-20. Status: `don
 | Requirement | Status | Where | Notes |
 |---|---|---|---|
 | Email/password registration, login, logout | done | `src/lib/auth.ts`, `src/app/api/auth/[...all]/route.ts`, `src/app/(auth)/{login,signup}` | Better Auth email/password enabled. |
-| Password change / reset | done | `src/lib/auth.ts` (`sendResetPassword`), `src/app/(auth)/{forgot-password,reset-password}` | SMTP optional; reset links logged to console in dev (`src/lib/mailer.ts`). |
+| Password change / reset | done | `src/lib/auth.ts` (`sendResetPassword`), `src/app/(auth)/{forgot-password,reset-password}` | **Corrected 2026-09-28** (this row said reset links are logged to the console in dev). With `SMTP_HOST` empty the auth route answers reset requests with `503 email_delivery_unavailable` before `sendMail` is called, so the console branch in `src/lib/mailer.ts` is unreachable over HTTP; it exists for direct calls and tests. |
 | Session management / protected dashboard routes | done | `src/lib/authn.ts`, `src/app/(dashboard)/layout.tsx` | Session cookie principal. |
 | Separate human vs machine credentials | done | `src/lib/api-keys.ts`, `src/lib/authn.ts`, `src/app/mcp/route.ts` | API keys (`rt_…`) hashed at rest; MCP is API-key only. |
 | No OAuth/SSO/orgs/RBAC in V1 | done | — | Correctly absent. |
@@ -48,10 +80,10 @@ Signature validation (HMAC-SHA256, global or per-project derived secret), delive
 | Incremental (content hashes, skip unchanged, delete removed) | done | `src/lib/indexing/pipeline.ts` (`processFile`, `deleteFileFromIndex`) | |
 | Semantic chunking (per-declaration + fallback + markdown sections) | done | `src/lib/indexing/parser.ts` | Gap blocks max 150 lines; non-AST languages block-chunked. |
 | Symbol index: calls/imports/extends + qualified names | done | `src/lib/indexing/parser.ts`, `src/lib/search/structural.ts` | |
-| `implements` relationship | partial | `parser.ts` extracts it | Dropped at persist time — pipeline writes only `calls`/`imports`/`extends` (`pipeline.ts:375-379`). |
+| `implements` relationship | partial | `parser.ts` extracts it | Dropped at persist time — pipeline writes only `calls`/`imports`/`extends` (see the `symbolRows` metadata in `processFile`). |
 | `reads_from` / `writes_to` / `routes_to` relationships | missing | — | Not extracted anywhere. |
-| Unsupported/malformed files never crash a job | done | `parser.ts` fallbacks | Per-file embed failures mark the file `failed` with the error. |
-| Parse errors surfaced to the dashboard | partial | `parser.ts` returns `error`; `pipeline.ts` ignores it | Files that fall back to block chunking are marked `indexed` and the parse error is dropped — only *embedding* failures mark a file failed. |
+| Unsupported/malformed files never crash a job | done | `parser.ts` fallbacks; `runIndexJob` -> `processFile`, the guarded `parseFile` call | The `parseFile` call is guarded, so a throwing parse is caught and the file falls back to block chunking instead of aborting the run. Per-file embed failures mark the file `failed` with the error. |
+| Parse errors surfaced to the dashboard | done | `parser.ts` returns `error`; `parseFile` -> `processFile`, which persists the reason to `file.error` persists it | **Corrected 2026-09-28** (this row said `partial`, "the parse error is dropped"). A parse-fallback file is still marked `indexed` — its text is searchable, it just contributes no symbols — but the reason is written to `file.error`, returned by `GET /files`, and rendered as a tooltip in the project page's Files tab. What the file is *not* is `failed`: `index-status.failedFiles` counts only embedding and persist failures. |
 
 ## Embeddings (spec §12, §13)
 
@@ -128,9 +160,9 @@ Full surface implemented under `/api/v1/*` (projects, files, stats, index-status
 
 | Requirement | Status | Where | Notes |
 |---|---|---|---|
-| Health endpoint (PG/Qdrant/queue/embedding/sync/workers) | done | `GET /api/v1/health` | Requires auth — unusable by unauthenticated proxies/LB without a credential. |
+| Health endpoint (PG/Qdrant/queue/embedding/sync/workers) | done | `GET /api/v1/health` (public liveness) + `GET /api/v1/health/status` (authenticated detail) | **Corrected 2026-09-28** (this row predates the split and said the endpoint required auth). The public probe is now unauthenticated and returns 503 when degraded; the full diagnostic view moved to the authenticated `/status` route. |
 | Metric events tracked | done | `src/lib/metrics.ts` | Latency, failures, queue depth. |
-| Failed files exposed | done | `/files?status=failed`, `/stats` | Only *embedding* failures surface; parse-fallback errors are dropped (see indexing notes). |
+| Failed files exposed | done | `/files?status=failed`, `/stats` | **Corrected 2026-09-28** (this row said parse-fallback errors are dropped). `status=failed` is still set only by embedding and persist failures, but a parse-fallback file carries its reason in `file.error`, which `/files` returns and the Files tab shows. |
 | Health page in dashboard | missing | — | API exists; page doesn't. |
 
 ## Config & DX (spec §33, §34)
@@ -152,7 +184,7 @@ Env-validated config (`src/lib/env.ts`), `.env.example`, docker-compose, migrati
 
 1. **No automated tests** — spec §36 and acceptance criterion #22 are entirely unmet; `tests/` is absent and `npm test` has no suites. Highest-risk gap for an indexer + auth surface.
 2. **Multi-word lexical search is broken** — `to_tsquery('simple', …)` throws on multi-token queries and the ILIKE fallback is a literal substring match (`src/lib/search/lexical.ts:68-88`), so natural-language lexical queries (`where is notify imported`) return nothing. Confirmed live via the eval harness (`notify-import` question scores 0).
-3. **Parse failures are silently downgraded** — files whose grammar is missing (e.g. the `service.py` fixture is whole-file fallback-chunked with zero symbols) or whose AST parse fails are marked `indexed`; the parser's `error` field is dropped in `processFile` (`pipeline.ts:311`), so spec §32's "dashboard must expose failed files" only holds for embedding failures.
+3. ~~**Parse failures are silently downgraded**~~ — **closed 2026-09-28.** The row above and the observability row were both wrong about the current code, in the same way. `parseFile` is now guarded (`runIndexJob` -> `processFile`, the guarded `parseFile` call), so a bad file falls back to block chunking instead of aborting the job, and its reason is persisted to `file.error` (`processFile`, which persists the reason to `file.error`) rather than dropped; `GET /files` returns that column and the Files tab renders it as a tooltip. What remains true: a parse-fallback file is `indexed`, not `failed`, because its text is searchable — so `index-status.failedFiles` still counts only embedding and persist failures.
 4. **Dashboard is mid-construction** — project detail page imports `project-tabs`/`project-actions` components that don't exist yet; no Search UI, no Health/Embeddings/Settings pages (spec §20-23, #18).
 5. **Job telemetry is not persisted** — `IndexResult` (files/chunks/embeddings/vectors) is computed but never stored on the `job` row, so the API can't report per-job counters (spec §24).
 6. **Structural index coverage** — `implements` is parsed but dropped at persist; `reads_from`/`writes_to`/`routes_to` are not implemented; `findReferences` runs a JS scan over a 500-symbol cap (spec §11).

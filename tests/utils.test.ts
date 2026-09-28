@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { mergeAndRerank, type SearchResultItem } from "@/lib/search/hybrid";
 import type { VectorHit } from "@/lib/qdrant";
 import type { LexicalHit } from "@/lib/search/lexical";
+import { buildTsQuery } from "@/lib/search/lexical";
 
 function payload(path: string, startLine: number, content = "chunk"): VectorHit["payload"] {
   return {
@@ -110,5 +111,107 @@ describe("mergeAndRerank", () => {
     expect(result.items).toHaveLength(2);
     expect(result.sources.vector).toBeGreaterThan(0);
     expect(result.sources.lexical).toBeGreaterThan(0);
+  });
+
+  // Regression: the rerank used `item.score` as BOTH the vector and the lexical
+  // contribution. A chunk found by both sources had its single max score
+  // counted twice, so dual-source hits were inflated past their actual evidence
+  // and the separate multi-source bonus was paid on top of a double count.
+  it("scores a dual-source hit using each source's own score, not the max twice", () => {
+    // "dual.ts" ranks first by vector (normalised 1.0) but only second by
+    // lexical (normalised 0.4), so the two contributions genuinely differ.
+    //   old: 0.55*max(1.0,0.4) + 0.45*max(1.0,0.4) = 0.55 + 0.45 = 1.00
+    //   new: 0.55*1.0            + 0.45*0.4        = 0.55 + 0.18 = 0.73
+    const result = mergeAndRerank(
+      {
+        vectorHits: [
+          { score: 1.0, payload: payload("dual.ts", 1) },
+          { score: 0.9, payload: payload("solo.ts", 1) },
+        ],
+        lexicalHits: [lexicalHit("other.ts", 1, 1.0), lexicalHit("dual.ts", 1, 0.4)],
+        symbolHits: [],
+      },
+      { limit: 5, lexicalWeight: 0.45 },
+    );
+    const dual = result.items.find((i) => i.path === "dual.ts")!;
+    // + multiSource (0.30) + rrf*0.3 (~0.010)
+    expect(dual.hybridScore).toBeCloseTo(0.73 + 0.3 + 0.0104, 3);
+    // A double-counted max would land near 1.31.
+    expect(dual.hybridScore).toBeLessThan(1.2);
+  });
+
+  it("ranks a single-source hit below a comparable dual-source hit", () => {
+    const result = mergeAndRerank(
+      {
+        vectorHits: [
+          { score: 1.0, payload: payload("both.ts", 1) },
+          { score: 0.95, payload: payload("only-vector.ts", 1) },
+        ],
+        lexicalHits: [lexicalHit("both.ts", 1, 1.0)],
+        symbolHits: [],
+      },
+      { limit: 5 },
+    );
+    expect(result.items[0].path).toBe("both.ts");
+  });
+
+  it("is deterministic: identical inputs give identical ordering", () => {
+    const build = () =>
+      mergeAndRerank(
+        {
+          vectorHits: [
+            { score: 0.5, payload: payload("tie-b.ts", 1) },
+            { score: 0.5, payload: payload("tie-a.ts", 1) },
+            { score: 0.5, payload: payload("tie-c.ts", 1) },
+          ],
+          lexicalHits: [],
+          symbolHits: [],
+        },
+        { limit: 5 },
+      );
+    const first = names(build().items);
+    for (let i = 0; i < 5; i++) expect(names(build().items)).toEqual(first);
+  });
+});
+describe("buildTsQuery", () => {
+  // Regression: the lexical leg built its tsquery with `to_tsquery('simple', q)`
+  // and handed the raw query string over, so whitespace became `&` and
+  // "how does order expiry work" demanded a chunk containing all five words.
+  // Natural-language search — the product's reason for existing — returned
+  // nothing from the lexical leg.
+  it("ORs the terms so a natural-language query matches any of them", () => {
+    expect(buildTsQuery("how does order expiry work").tsQuery).toBe(
+      "how | does | order | expiry | work",
+    );
+  });
+
+  it("keeps a single identifier as one lexeme", () => {
+    expect(buildTsQuery("cancelOrder").tsQuery).toBe("cancelOrder");
+  });
+
+  it("splits punctuation and camelCase is preserved verbatim", () => {
+    expect(buildTsQuery("OrderService.cancelOrder").terms).toEqual([
+      "OrderService",
+      "cancelOrder",
+    ]);
+    expect(buildTsQuery("a.b,c;d").terms).toEqual(["a", "b", "c", "d"]);
+  });
+
+  // tsquery operators must never survive sanitisation: a query containing
+  // `& | ! ( ) : *` is otherwise a syntax error or, worse, a different query.
+  it("strips tsquery operators so the parser cannot see them", () => {
+    const { tsQuery } = buildTsQuery("foo & bar | baz ! (qux) :* ");
+    expect(tsQuery).toBe("foo | bar | baz | qux");
+    expect(tsQuery).not.toMatch(/[&!():*\\]/);
+  });
+
+  it("reports no tsquery for a query with no usable term", () => {
+    expect(buildTsQuery("").tsQuery).toBeNull();
+    expect(buildTsQuery("   ...  ***  ").tsQuery).toBeNull();
+  });
+
+  it("caps the term count so a huge query cannot build an enormous tsquery", () => {
+    const many = Array.from({ length: 200 }, (_, i) => `t${i}`).join(" ");
+    expect(buildTsQuery(many).terms).toHaveLength(16);
   });
 });

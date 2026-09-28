@@ -1,85 +1,126 @@
-import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { decryptSecret, encryptSecret } from "@/lib/encryption";
+import { createCipheriv, randomBytes } from "node:crypto";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+
+/**
+ * These tests drive `@/lib/encryption` itself, never a re-implementation of it.
+ *
+ * `deriveKey` memoizes the key in a module-level `cachedKey` and `@/lib/env`
+ * memoizes its parsed schema, so nothing here can be asserted through a
+ * top-level import: the value read at import time is the value under test. Each
+ * test therefore sets the key, resets the module registry and imports afresh,
+ * which is also the only way to compare two keys in one process.
+ *
+ * The keys are generated here rather than read from the environment so the file
+ * does not depend on a deployment's `REPO_CREDENTIALS_KEY` being a valid
+ * 32-byte value.
+ */
 
 const ALGO = "aes-256-gcm";
 const IV_LEN = 12;
-const TAG_LEN = 16;
 
-function decryptWithKey(encoded: string, key: Buffer): string {
-  const raw = Buffer.from(encoded, "base64");
-  const iv = raw.subarray(0, IV_LEN);
-  const tag = raw.subarray(raw.length - TAG_LEN);
-  const ct = raw.subarray(IV_LEN, raw.length - TAG_LEN);
-  const decipher = createDecipheriv(ALGO, key, iv);
-  decipher.setAuthTag(tag);
-  const out = decipher.update(ct);
-  return Buffer.concat([out, decipher.final()]).toString("utf8");
+const KEY_A = randomBytes(32);
+const KEY_B = randomBytes(32);
+
+let originalKey: string | undefined;
+
+beforeAll(() => {
+  originalKey = process.env.REPO_CREDENTIALS_KEY;
+});
+
+afterEach(() => {
+  if (originalKey === undefined) delete process.env.REPO_CREDENTIALS_KEY;
+  else process.env.REPO_CREDENTIALS_KEY = originalKey;
+  vi.resetModules();
+});
+
+/** A module-fresh `@/lib/encryption` that will derive its key from `key`. */
+async function loadedWith(key: Buffer) {
+  process.env.REPO_CREDENTIALS_KEY = key.toString("base64");
+  vi.resetModules();
+  return import("@/lib/encryption");
+}
+
+/** The documented wire format, written by hand: base64(iv | ciphertext | tag). */
+function seal(plaintext: string, key: Buffer): string {
+  const iv = randomBytes(IV_LEN);
+  const cipher = createCipheriv(ALGO, key, iv);
+  const ct = cipher.update(plaintext);
+  cipher.final();
+  return Buffer.concat([iv, ct, cipher.getAuthTag()]).toString("base64");
 }
 
 describe("key format handling", () => {
-  afterEach(() => {
-    vi.resetModules();
-  });
-
   it("rejects a key that does not decode to exactly 32 bytes", async () => {
-    const previous = process.env.REPO_CREDENTIALS_KEY;
-    process.env.REPO_CREDENTIALS_KEY = "c2hvcnRy";
+    // "c2hvcnRy" is base64 for "short": 5 bytes, so the length check is what
+    // has to fire, not the cipher (which wants exactly 32).
+    process.env.REPO_CREDENTIALS_KEY = Buffer.from("short").toString("base64");
     vi.resetModules();
     const fresh = await import("@/lib/encryption");
     expect(() => fresh.encryptSecret("x")).toThrowError(/exactly 32 bytes/);
-    process.env.REPO_CREDENTIALS_KEY = previous;
   });
 
   it("rejects a missing key with a clear error", async () => {
-    const previous = process.env.REPO_CREDENTIALS_KEY;
-    process.env.REPO_CREDENTIALS_KEY = "";
+    // The variable is DELETED, not set to "": `REPO_CREDENTIALS_KEY` is declared
+    // `z.string().min(1).default("")`, so an explicit empty string is rejected
+    // earlier by env validation with a different message. Unset is what lets
+    // the default through and reaches `deriveKey`'s own "not configured"
+    // branch, which is the branch this test is named for.
+    delete process.env.REPO_CREDENTIALS_KEY;
     vi.resetModules();
     const fresh = await import("@/lib/encryption");
-    expect(() => fresh.encryptSecret("x")).toThrowError(/REPO_CREDENTIALS_KEY/);
-    process.env.REPO_CREDENTIALS_KEY = previous;
+    expect(() => fresh.encryptSecret("x")).toThrowError(
+      /REPO_CREDENTIALS_KEY is not configured/,
+    );
   });
 });
 
 describe("encryptSecret", () => {
-  it("round-trips a secret", () => {
+  it("round-trips a secret through decryptSecret", async () => {
+    const { encryptSecret, decryptSecret } = await loadedWith(KEY_A);
     const secret = "ghp_token_1234567890abcdef";
     const encoded = encryptSecret(secret);
     expect(decryptSecret(encoded)).toBe(secret);
   });
 
-  it("does not store the plaintext", () => {
+  it("does not store the plaintext", async () => {
+    const { encryptSecret } = await loadedWith(KEY_A);
     const encoded = encryptSecret("super-secret-value");
     expect(encoded).not.toContain("super-secret-value");
     expect(encoded).toMatch(/^[A-Za-z0-9+/]+=*$/);
   });
 
-  it("uses a fresh IV so identical inputs produce different ciphertexts", () => {
+  it("uses a fresh IV so identical inputs produce different ciphertexts", async () => {
+    const { encryptSecret, decryptSecret } = await loadedWith(KEY_A);
     const a = encryptSecret("same-input");
     const b = encryptSecret("same-input");
     expect(a).not.toBe(b);
+    // Both still read back, so the difference is the IV and not corruption.
+    expect([decryptSecret(a), decryptSecret(b)]).toEqual(["same-input", "same-input"]);
   });
 
-  it("fails to decrypt with a different key (GCM auth tag)", () => {
-    const keyA = randomBytes(32);
-    const keyB = randomBytes(32);
-    const iv = randomBytes(IV_LEN);
-    const cipher = createCipheriv(ALGO, keyA, iv);
-    const ct = cipher.update("payload");
-    cipher.final();
-    const encoded = Buffer.concat([iv, ct, cipher.getAuthTag()]).toString("base64");
+  // Both halves go through the exported `decryptSecret`, each against a
+  // different process-wide key: encrypt under KEY_A, then read the same bytes
+  // back under KEY_B and require the GCM auth tag to reject them. Testing this
+  // with a local re-implementation of the decipher would pass even if
+  // `decryptSecret` were deleted.
+  it("decrypts under the key it was encrypted with and refuses a different one", async () => {
+    const encA = await loadedWith(KEY_A);
+    const encoded = encA.encryptSecret("payload");
 
-    expect(decryptWithKey(encoded, keyA)).toBe("payload");
-    expect(() => decryptWithKey(encoded, keyB)).toThrow();
+    const decA = await loadedWith(KEY_A);
+    expect(decA.decryptSecret(encoded)).toBe("payload");
+
+    const decB = await loadedWith(KEY_B);
+    expect(() => decB.decryptSecret(encoded)).toThrow();
   });
 
-  it("produces a value the deployed decrypt path can read", () => {
-    const key = randomBytes(32);
-    const iv = randomBytes(IV_LEN);
-    const cipher = createCipheriv(ALGO, key, iv);
-    const ct = cipher.update("hello");
-    cipher.final();
-    const encoded = Buffer.concat([iv, ct, cipher.getAuthTag()]).toString("base64");
-    expect(decryptWithKey(encoded, key)).toBe("hello");
+  // Pins the storage contract rather than a round trip: a ciphertext written
+  // as base64(iv | ciphertext | tag) — the layout documented on
+  // `encryptSecret` — is what `decryptSecret` must be able to read. Changing
+  // either side of the format breaks real rows in the database, so this fails
+  // even though nothing in the test calls `encryptSecret`.
+  it("reads a ciphertext in the documented base64(iv | ciphertext | tag) layout", async () => {
+    const { decryptSecret } = await loadedWith(KEY_A);
+    expect(decryptSecret(seal("hello", KEY_A))).toBe("hello");
   });
 });

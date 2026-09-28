@@ -49,9 +49,33 @@ describe("fileCategory", () => {
     expect(fileCategory("src/orders/orders.spec.ts")).toBe("test");
     expect(fileCategory("test_orders.py")).toBe("test");
     expect(fileCategory("src/orders/orders_test.py")).toBe("test");
-    // ponytail: fileCategory inspects the basename only, so a __tests__
-    // directory segment is invisible here (dead regex branch in prod).
-    expect(fileCategory("src/__tests__/orders.ts")).toBe("code");
+    expect(fileCategory("src/orders/orders.tests.js")).toBe("test");
+  });
+
+  it("classifies every file under a __tests__ directory as a test", () => {
+    // `__tests__` is a directory: the basename of `src/__tests__/orders.ts` is
+    // `orders.ts`, so this only works because the rule matches a path segment,
+    // not the basename.
+    expect(fileCategory("src/__tests__/orders.ts")).toBe("test");
+    expect(fileCategory("__tests__/orders.ts")).toBe("test");
+    expect(fileCategory("packages/api/src/__tests__/helpers/db.ts")).toBe("test");
+    // The segment matches anywhere in the path, not only at the root.
+    expect(fileCategory("src/__tests__/nested/deeper/fixture.ts")).toBe("test");
+    // It is a test rule, so it outranks documentation and configuration the
+    // same way the basename naming rules already did.
+    expect(fileCategory("src/__tests__/fixtures/sample.json")).toBe("test");
+  });
+
+  it("does not treat files that merely look like a __tests__ directory as tests", () => {
+    // Near misses: `__tests__` glued to another name is not the directory.
+    expect(fileCategory("src/__tests__helper/orders.ts")).toBe("code");
+    expect(fileCategory("src/my__tests__/orders.ts")).toBe("code");
+    expect(fileCategory("src/tests/__tests__extra/orders.ts")).toBe("code");
+    // A file named, or named like, `__tests__` is not the directory either.
+    expect(fileCategory("__tests__helper.ts")).toBe("code");
+    expect(fileCategory("src/orders/orders__tests__.ts")).toBe("code");
+    // A real test filename still wins inside a look-alike directory.
+    expect(fileCategory("src/__tests__helper/orders.test.ts")).toBe("test");
   });
 
   it("classifies documentation files", () => {

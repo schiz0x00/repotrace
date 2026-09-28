@@ -5,6 +5,8 @@
  * are handled by the fallback chunker — unsupported languages must never
  * crash an indexing job.
  */
+import Parser from "tree-sitter";
+import type { Language } from "tree-sitter";
 
 export type SymbolKind =
   | "function"
@@ -33,30 +35,68 @@ export interface LanguageDefinition {
 }
 
 /**
- * Loads a grammar module and unwraps its exports. CJS packages surface as
- * { default: exports } under ESM dynamic import; some grammars export named
- * languages (typescript -> { typescript, tsx }) while others export the
- * language directly or as default.language.
+ * Resolves a tree-sitter grammar module to the object `Parser.setLanguage`
+ * actually accepts.
+ *
+ * There is no single export shape. `tree-sitter-typescript` and
+ * `tree-sitter-php` export the language under a name (`{ typescript, tsx }`,
+ * `{ php, php_only }`); every other grammar's `module.exports` *is* the
+ * Language object, and merely carries enumerable `language` and
+ * `nodeTypeInfo` properties alongside it. Under ESM, a CJS package arrives as
+ * `{ default: exports }` — but the exact nesting differs between plain node,
+ * vitest and a bundled build.
+ *
+ * The previous code guessed, by looking up the named export and otherwise
+ * returning the module. The guess was wrong in both directions, and it failed
+ * *silently*: a wrong shape made `preloadGrammars` swallow the error, the
+ * language never entered the cache, and every file of that language was
+ * indexed with zero symbols and zero relationships while the job still
+ * reported success. The majority of the declared AST languages were affected.
+ *
+ * So rather than guess, try each plausible shape and keep the first one the
+ * parser actually accepts. A grammar that cannot be resolved returns
+ * undefined, which `preloadGrammars` logs and `unavailableGrammars()` reports
+ * instead of hiding.
  */
 async function loadGrammarModule(
   pkg: string,
   named?: string[],
-  isEsm?: boolean,
 ): Promise<unknown> {
-  const mod = (await import(pkg)) as Record<string, unknown>
-  const exports_ = (mod.default ?? mod) as Record<string, unknown>
+  const mod = (await import(pkg)) as Record<string, unknown>;
+  const root = (mod.default ?? mod) as Record<string, unknown>;
+  const inner = (root?.default as Record<string, unknown> | undefined) ?? root;
+
+  const candidates: unknown[] = [];
   if (named) {
     for (const name of named) {
-      const candidate = exports_[name] ?? (exports_.default as Record<string, unknown> | undefined)?.[name];
-      if (candidate) return candidate;
+      candidates.push(root?.[name], inner?.[name], mod[name]);
     }
-    return undefined;
   }
-  // The default export IS the Language object for both the legacy bindings
-  // (module.exports = Language) and the 0.25-style bindings that also carry a
-  // `.language` namespace property which is NOT a Language (passing it to
-  // Parser.setLanguage throws).
-  return exports_ ?? undefined;
+  // The module object itself is the Language for every non-named grammar, and
+  // is a valid fallback for the named ones too.
+  candidates.push(mod, root, inner);
+
+  for (const candidate of candidates) {
+    if (candidate && isUsableGrammar(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+/** Whether the parser actually accepts this object as a language. */
+function isUsableGrammar(candidate: unknown): boolean {
+  try {
+    const parser = new Parser();
+    parser.setLanguage(candidate as Language);
+    // setLanguage alone is not proof. Under a bundler or a test runner's
+    // module interop the ESM namespace object itself can be accepted here and
+    // then fail on any real input, so parse actual tokens: an empty string
+    // short-circuits before the grammar's node table is ever touched, which
+    // let a broken candidate through.
+    const tree = parser.parse("a");
+    return typeof tree.rootNode.type === "string" && tree.rootNode.type.length > 0;
+  } catch {
+    return false;
+  }
 }
 
 const grammarModules: Record<string, () => Promise<unknown> | unknown> = {
@@ -69,12 +109,12 @@ const grammarModules: Record<string, () => Promise<unknown> | unknown> = {
   java: () => loadGrammarModule("tree-sitter-java", ["java"]),
   c: () => loadGrammarModule("tree-sitter-c", ["c"]),
   cpp: () => loadGrammarModule("tree-sitter-cpp", ["cpp"]),
-  csharp: () => loadGrammarModule("tree-sitter-c-sharp", undefined, true),
+  csharp: () => loadGrammarModule("tree-sitter-c-sharp"),
   php: () => loadGrammarModule("tree-sitter-php", ["php"]),
   ruby: () => loadGrammarModule("tree-sitter-ruby", ["ruby"]),
   bash: () => loadGrammarModule("tree-sitter-bash", ["bash"]),
   json: () => loadGrammarModule("tree-sitter-json", ["json"]),
-  css: () => loadGrammarModule("tree-sitter-css", undefined, true),
+  css: () => loadGrammarModule("tree-sitter-css"),
   html: () => loadGrammarModule("tree-sitter-html", ["html"]),
 };
 
@@ -374,20 +414,7 @@ export function detectLanguage(path: string): DetectedLanguage {
   };
 }
 
-/** Classifies a file by path: code, test, documentation, or configuration. */
-export function fileCategory(path: string): "code" | "test" | "documentation" | "configuration" {
-  const base = path.split("/").pop() ?? path;
-  if (/\.(test|spec)\.[a-z0-9]+$|_test\.[a-z0-9]+$|\.tests?\.[a-z0-9]+$|^test_|__tests__|_test\.py$|\.test\.|\.spec\./.test(base)) {
-    return "test";
-  }
-  if (/\.(md|mdx|markdown|rst|txt|adoc)$/.test(base) || /^docs?\//.test(path)) {
-    return "documentation";
-  }
-  if (/\.(json|jsonc|yaml|yml|toml|ini|cfg|conf|config|properties|env|editorconfig|gitignore|dockerignore)$/.test(base) ||
-      /^(Dockerfile|Containerfile|Makefile|makefile|GNUMakefile|\.env.*)$/.test(base) ||
-      /\.(lock|lockb)$/.test(base) ||
-      /^(package\.json|tsconfig.*\.json|vitest\.config.*|jest\.config.*|next\.config.*|eslint\.config.*|prettier\.config.*|biome\.json|pyproject\.toml|Cargo\.toml|go\.mod|go\.sum|requirements.*\.txt|Pipfile|poetry\.lock)$/.test(base)) {
-    return "configuration";
-  }
-  return "code";
-}
+// Re-exported for callers that already import the language registry. The
+// implementation lives in file-category.ts so the search layer can use it
+// without importing the native tree-sitter addon into the server bundle.
+export { fileCategory } from "@/lib/indexing/file-category";

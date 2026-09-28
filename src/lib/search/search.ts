@@ -1,8 +1,9 @@
-import type { ChunkType } from "@/generated/prisma/enums";
+import { ChunkType } from "@/generated/prisma/enums";
+import { CATEGORY_TO_CHUNK_TYPE, fileCategory } from "@/lib/indexing/file-category";
 import { notFound } from "@/lib/errors";
 import { prisma } from "@/lib/prisma";
 import { recordMetric } from "@/lib/metrics";
-import { hybridSearch, type HybridOptions, type HybridResult, type SearchResultItem } from "@/lib/search/hybrid";
+import { hybridSearch, type HybridOptions, type SearchResultItem } from "@/lib/search/hybrid";
 import { lexicalSearch, type LexicalHit } from "@/lib/search/lexical";
 import { semanticSearch } from "@/lib/search/semantic";
 import {
@@ -15,6 +16,20 @@ import {
 } from "@/lib/search/structural";
 
 export type SearchMode = "hybrid" | "lexical" | "semantic" | "symbol";
+
+/**
+ * Every valid ChunkType, derived from the Prisma enum so the list cannot drift
+ * again. Three call sites previously carried their own hardcoded array.
+ *
+ * Deriving from the enum is a superset of what the pipeline currently emits:
+ * `chunkTypeOf` in the indexing pipeline only ever produces code, test,
+ * documentation or configuration, so `other` exists in the schema but is
+ * unused. Keeping the full set costs nothing and means a caller can pass it
+ * through; the invariant that matters is that this list can no longer fall
+ * behind the enum.
+ */
+export const CHUNK_TYPE_VALUES = Object.values(ChunkType);
+
 
 export interface SearchOptions {
   mode?: SearchMode;
@@ -97,7 +112,15 @@ export async function searchProject(
       .slice(0, limit);
     sources.vector = items.length;
   } else if (mode === "symbol") {
-    const hits = await searchSymbols(projectId, query, { limit: limit * 3 });
+    // Nothing reranks these: `searchSymbols` orders by name ascending and
+    // returns at most what it is asked for, so fetching more than `limit` rows
+    // bought nothing and the surplus was discarded by a slice. It once returned
+    // `limit * 3` items outright, so `?limit=10` could produce 30 — the
+    // parameter was a suggestion, not a contract. It is a contract again:
+    // exactly `limit` items come back, or fewer if fewer symbols match. Which
+    // `limit` of them come back is decided by the name-ascending order, not by
+    // any relevance score.
+    const hits = await searchSymbols(projectId, query, { limit });
     items = hits.map((s) => ({
       chunkId: null,
       fileId: "",
@@ -108,7 +131,14 @@ export async function searchProject(
       startLine: s.startLine,
       endLine: s.endLine,
       content: "",
-      chunkType: "code" as ChunkType,
+      // The file's real category, from the same rule the pipeline and the
+      // lexical leg use. This was left hardcoded to "code" while the fix for
+      // exactly that hardcoding landed in the other search file, so a symbol
+      // from a test or a markdown file was still tagged as source — and a
+      // `chunkTypes` filter passed against symbol results that did not honour
+      // it. Labelling is fixed; the filter still is not applied in this mode,
+      // because `searchSymbols` has no chunk-type option to pass it to.
+      chunkType: CATEGORY_TO_CHUNK_TYPE[fileCategory(s.path)],
       score: 1,
       hybridScore: 1,
       provenance: ["symbol" as const],

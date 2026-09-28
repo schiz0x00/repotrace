@@ -2,7 +2,6 @@ import type { ChunkType } from "@/generated/prisma/enums";
 import { lexicalSearch, symbolNameSearch, type LexicalHit } from "@/lib/search/lexical";
 import { semanticSearch } from "@/lib/search/semantic";
 import type { VectorHit } from "@/lib/qdrant";
-import { prisma } from "@/lib/prisma";
 
 /**
  * Hybrid retrieval: lexical + semantic (+ symbol) results are merged and
@@ -77,7 +76,10 @@ export async function hybridSearch(
       chunkTypes: opts.chunkTypes,
       languages: opts.languages,
     }),
-    symbolNameSearch(projectId, query, lexicalLimit),
+    symbolNameSearch(projectId, query, lexicalLimit, {
+      chunkTypes: opts.chunkTypes,
+      languages: opts.languages,
+    }),
   ]);
 
   return mergeAndRerank({ vectorHits, lexicalHits, symbolHits }, { limit, lexicalWeight: opts.lexicalWeight });
@@ -95,6 +97,12 @@ export function mergeAndRerank(
 
   // Dedupe by (path, startLine).
   const byKey = new Map<string, SearchResultItem>();
+  // Per-source normalized scores are tracked separately. `SearchResultItem`
+  // has a single `score` field, so folding both sources into it made the final
+  // rerank use the same number as both the vector and the lexical contribution
+  // — double-counting the strongest signal for any chunk both sources found.
+  const vectorScoreByKey = new Map<string, number>();
+  const lexicalScoreByKey = new Map<string, number>();
 
   const vectorMax = sources.vectorHits[0]?.score ?? 1;
   sources.vectorHits.forEach((hit, index) => {
@@ -102,6 +110,7 @@ export function mergeAndRerank(
     const existing = byKey.get(key);
     const score = vectorMax > 0 ? hit.score / vectorMax : 0;
     const rrf = 1 / (60 + index);
+    vectorScoreByKey.set(key, score);
     if (!existing) {
       byKey.set(key, {
         chunkId: hit.payload.chunk_id,
@@ -115,7 +124,9 @@ export function mergeAndRerank(
         content: hit.payload.content,
         chunkType: hit.payload.chunk_type as ChunkType,
         score,
-        hybridScore: score,
+        // Accumulates reciprocal-rank only; never a raw score, so the final
+        // rerank always sees a comparable RRF value.
+        hybridScore: rrf * SOURCE_WEIGHTS.vector,
         provenance: ["vector"],
       });
     } else {
@@ -132,6 +143,7 @@ export function mergeAndRerank(
     const existing = byKey.get(key);
     const score = lexicalMax > 0 ? hit.score / lexicalMax : 0;
     const rrf = 1 / (60 + index);
+    lexicalScoreByKey.set(key, score);
     if (!existing) {
       byKey.set(key, {
         chunkId: hit.chunkId,
@@ -145,7 +157,7 @@ export function mergeAndRerank(
         content: hit.content,
         chunkType: hit.chunkType,
         score,
-        hybridScore: score,
+        hybridScore: rrf * SOURCE_WEIGHTS.lexical,
         provenance: ["lexical"],
       });
     } else {
@@ -185,14 +197,21 @@ export function mergeAndRerank(
   // Final rerank: weight vector-score and lexical-score plus multi-source bonus.
   const items = [...byKey.values()];
   for (const item of items) {
-    const vectorContrib = item.provenance.includes("vector") ? item.score : 0;
-    const lexicalContrib = item.provenance.includes("lexical") ? item.score : 0;
+    const key = `${item.path}:${item.startLine}`;
+    const vectorContrib = vectorScoreByKey.get(key) ?? 0;
+    const lexicalContrib = lexicalScoreByKey.get(key) ?? 0;
     const multiSource = item.provenance.length > 1 ? 0.15 * item.provenance.length : 0;
     const rrf = item.hybridScore ?? 0;
     item.hybridScore =
       (1 - lexicalWeight) * vectorContrib + lexicalWeight * lexicalContrib + multiSource + rrf * 0.3;
   }
-  items.sort((a, b) => b.hybridScore - a.hybridScore);
+  // Sort by score, then by a stable key so equal-scoring results do not
+  // reshuffle between identical queries.
+  items.sort((a, b) => {
+    if (b.hybridScore !== a.hybridScore) return b.hybridScore - a.hybridScore;
+    const pathCmp = a.path.localeCompare(b.path);
+    return pathCmp !== 0 ? pathCmp : a.startLine - b.startLine;
+  });
 
   const countProvenance = (p: Provenance) => items.filter((i) => i.provenance.includes(p)).length;
   return {
@@ -207,15 +226,4 @@ export function mergeAndRerank(
 
 function indexOfSymbol(symbolHits: LexicalHit[], hit: LexicalHit): number {
   return symbolHits.findIndex((h) => h.path === hit.path && h.startLine === hit.startLine);
-}
-
-/** Resolves full file content for a search result (via file id). */
-export async function fileContentForChunk(chunkId: string | null, fileId: string): Promise<string | null> {
-  const db = prisma();
-  if (chunkId) {
-    const chunk = await db.chunk.findUnique({ where: { id: chunkId }, select: { content: true } });
-    if (chunk) return chunk.content;
-  }
-  const file = await db.file.findUnique({ where: { id: fileId }, select: { path: true } });
-  return file?.path ?? null;
 }

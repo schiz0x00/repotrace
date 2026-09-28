@@ -1,110 +1,91 @@
 import { route, json } from "@/lib/http";
-import { requirePrincipal } from "@/lib/api/guard";
 import { prisma } from "@/lib/prisma";
 import { qdrantHealth } from "@/lib/qdrant";
 import { queueDepth } from "@/lib/jobs/queue";
-import { env } from "@/lib/env";
-import { resolveEmbeddingConfig } from "@/lib/embedding/provider";
 
 export const runtime = "nodejs";
 
 /**
- * GET /api/v1/health — system health page data.
- * PostgreSQL / Qdrant / Job Queue / Embedding API / Repository Sync / Workers.
+ * Ceiling on a single dependency probe.
+ *
+ * A dependency that is *down* rejects, and both wrappers below swallow that.
+ * A dependency that is *wedged* — a black-holed host, a pool blocked on a full
+ * connection queue — never settles at all, and an unbounded await turns the one
+ * route that every unauthenticated caller may reach into a request that hangs
+ * for as long as the operator's healthcheck interval, or forever. The cost of
+ * the bound is that a dependency which is merely slow is reported unhealthy for
+ * one reading, which is the conservative direction for a liveness probe.
+ *
+ * All three probes run concurrently, so the response is bounded by this one
+ * ceiling rather than three of them.
+ */
+const PROBE_TIMEOUT_MS = 5_000;
+
+/**
+ * Runs one probe and reduces both failure modes — rejection and never settling —
+ * to a single boolean.
+ *
+ * The reason is logged, never returned: this endpoint is public and the
+ * existing contract is booleans only.
+ */
+async function probe(name: string, run: () => Promise<boolean>): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      run(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`timed out after ${PROBE_TIMEOUT_MS}ms`)), PROBE_TIMEOUT_MS);
+      }),
+    ]);
+  } catch (err) {
+    console.error(`[health] ${name} check failed: ${(err as Error).message}`);
+    return false;
+  } finally {
+    // Cleared even on success: a pending 5s timer per probe would hold the
+    // request's event loop open long after the response was written.
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * GET /api/v1/health — liveness probe.
+ *
+ * Deliberately public and deliberately cheap: it is what a container
+ * healthcheck or load balancer polls, so it must not make outbound paid calls,
+ * write metrics, or disclose infrastructure detail. The rich diagnostic view
+ * lives at /api/v1/health/status and requires authentication.
+ *
+ * Returns 503 when a core dependency is down so orchestrators can act on it —
+ * this previously always returned 200, so a failing instance looked healthy.
+ * A dependency that does not answer within PROBE_TIMEOUT_MS counts as down.
  */
 export async function GET(request: Request) {
   return route(async (req) => {
-    // Health endpoint is public — no auth required for proxies/load balancers.
     const started = Date.now();
 
-    // PostgreSQL
-    let postgres: { healthy: boolean; error?: string } = { healthy: false };
-    try {
-      await prisma().$queryRaw`SELECT 1`;
-      postgres = { healthy: true };
-    } catch (err) {
-      postgres = { healthy: false, error: (err as Error).message };
-    }
+    const [postgresHealthy, qdrantHealthy, queueHealthy] = await Promise.all([
+      probe("postgres", async () => {
+        await prisma().$queryRaw`SELECT 1`;
+        return true;
+      }),
+      // qdrantHealth() already turns its own errors into `{healthy: false}`;
+      // wrapped anyway so a stall inside it lands in the same place, and for
+      // the throw a future edit could add.
+      probe("qdrant", async () => (await qdrantHealth()).healthy),
+      // queueDepth() answers -1 rather than throwing when Redis is unreachable,
+      // so the depth is the signal and -1 must not read as "0 jobs".
+      probe("queue", async () => (await queueDepth()) >= 0),
+    ]);
 
-    const qdrant = await qdrantHealth();
-
-    // Job queue (Redis)
-    let queue: { healthy: boolean; depth: number; error?: string } = { healthy: false, depth: -1 };
-    try {
-      const depth = await queueDepth();
-      queue = { healthy: depth >= 0, depth };
-      if (queue.healthy) {
-        const { recordMetric } = await import("@/lib/metrics");
-        await recordMetric("queue_depth", depth);
-      }
-    } catch (err) {
-      queue = { healthy: false, depth: -1, error: (err as Error).message };
-    }
-
-    // Embedding API — config presence + live probe when configured.
-    let embedding: { healthy: boolean; configured: boolean; httpStatus?: number; error?: string } = {
-      healthy: false,
-      configured: false,
-    };
-    const cfg = env();
-    const config = await resolveEmbeddingConfig("__probe__").catch(() => null);
-    const effective = config ?? {
-      apiUrl: cfg.EMBEDDING_API_URL,
-      apiKey: cfg.EMBEDDING_API_KEY,
-      model: cfg.EMBEDDING_MODEL,
-    };
-    embedding = { healthy: false, configured: !!effective.apiUrl && !!effective.model };
-    if (embedding.configured) {
-      try {
-        const response = await fetch(
-          `${effective.apiUrl.replace(/\/+$/, "")}/embeddings`,
-          {
-            method: "POST",
-            headers: {
-              "content-type": "application/json",
-              ...(effective.apiKey ? { authorization: `Bearer ${effective.apiKey}` } : {}),
-            },
-            body: JSON.stringify({ model: effective.model, input: ["probe"] }),
-            signal: AbortSignal.timeout(10_000),
-          },
-        );
-        embedding = { healthy: response.ok, configured: true, httpStatus: response.status };
-      } catch (err) {
-        embedding = { healthy: false, configured: true, error: (err as Error).message };
-      }
-    }
-
-    // Repository sync: workspace health + per-repo sync status.
-    const repos = await prisma().repository.findMany({
-      select: { id: true, syncStatus: true, lastSuccessfulSync: true, syncError: true, projectId: true },
-    });
-    const syncFailures = repos.filter((r) => r.syncStatus === "error").length;
-    const repositorySync = {
-      healthy: syncFailures === 0,
-      repositories: repos.length,
-      failures: syncFailures,
-    };
-
-    // Workers: heartbeat via recent job activity.
-    const activeJobs = await prisma().job.count({
-      where: { status: { in: ["queued", "running"] } },
-    });
-    const recentCompleted = await prisma().job.count({
-      where: { status: "completed", completedAt: { gte: new Date(Date.now() - 15 * 60_000) } },
-    });
-
-    return json({
-      status: postgres.healthy && qdrant.healthy && queue.healthy ? "healthy" : "degraded",
-      checks: {
-        postgres,
-        qdrant,
-        queue,
-        embedding,
-        repositorySync,
-        workers: { activeJobs, recentCompleted, configuredConcurrency: cfg.WORKER_CONCURRENCY },
+    const healthy = postgresHealthy && qdrantHealthy && queueHealthy;
+    return json(
+      {
+        status: healthy ? "healthy" : "degraded",
+        // Component booleans only — no hostnames, versions or error strings.
+        checks: { postgres: postgresHealthy, qdrant: qdrantHealthy, queue: queueHealthy },
+        tookMs: Date.now() - started,
       },
-      version: "1.0.0",
-      tookMs: Date.now() - started,
-    });
+      healthy ? 200 : 503,
+    );
   })(request, {});
 }

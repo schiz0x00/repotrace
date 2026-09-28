@@ -1,4 +1,5 @@
 import { env } from "@/lib/env";
+import { decryptRepoCredentials } from "@/lib/git/workspace";
 import { recordMetric } from "@/lib/metrics";
 import { prisma } from "@/lib/prisma";
 
@@ -37,10 +38,16 @@ export async function resolveEmbeddingConfig(projectId: string): Promise<Embeddi
     },
   });
   const cfg = env();
+  // `embeddingApiKeyEnc` is AES-256-GCM ciphertext (see ProjectInput.embedding in
+  // src/lib/projects/service.ts), not the token itself. It has to be decrypted
+  // before it can be sent as a bearer credential.
+  const projectKey = project?.embeddingApiKeyEnc
+    ? decryptRepoCredentials(project.embeddingApiKeyEnc)?.token
+    : undefined;
   return {
     provider: project?.embeddingProvider || cfg.EMBEDDING_PROVIDER,
     apiUrl: project?.embeddingApiUrl || cfg.EMBEDDING_API_URL,
-    apiKey: project?.embeddingApiKeyEnc || cfg.EMBEDDING_API_KEY,
+    apiKey: projectKey || cfg.EMBEDDING_API_KEY,
     model: project?.embeddingModel || cfg.EMBEDDING_MODEL,
     dimensions: project?.embeddingDimensions || cfg.EMBEDDING_DIMENSIONS,
     batchSize: project?.embeddingBatchSize || cfg.EMBEDDING_BATCH_SIZE,

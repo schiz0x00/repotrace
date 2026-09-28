@@ -1,6 +1,6 @@
 import { auth } from "@/lib/auth";
 import { verifyApiKey } from "@/lib/api-keys";
-import { forbidden, unauthorized } from "@/lib/errors";
+import { unauthorized } from "@/lib/errors";
 import { prisma } from "@/lib/prisma";
 
 export interface ApiKeyPrincipal {
@@ -23,6 +23,9 @@ export type Principal = ApiKeyPrincipal | SessionPrincipal;
  *
  * Returns null when the request carries no credentials.
  */
+/** Minimum interval between `lastUsedAt` writes for the same key. */
+const LAST_USED_WRITE_INTERVAL_MS = 5 * 60_000;
+
 export async function authenticateRequest(
   request: Request,
 ): Promise<Principal | null> {
@@ -30,13 +33,20 @@ export async function authenticateRequest(
   if (header?.startsWith("Bearer ")) {
     const token = header.slice("Bearer ".length).trim();
     if (!token) throw unauthorized("invalid_api_key", "Missing API key");
-    const hash = await apiKeyHashFor(token);
-    if (!hash) throw unauthorized("invalid_api_key", "Invalid or revoked API key");
-    await prisma().apiKey.update({
-      where: { id: hash.id },
-      data: { lastUsedAt: new Date() },
-    });
-    return { type: "api_key", apiKeyId: hash.id, projectId: hash.projectId };
+    const key = await apiKeyHashFor(token);
+    if (!key) throw unauthorized("invalid_api_key", "Invalid or revoked API key");
+    // Throttled: this ran on every authenticated request, turning read-only
+    // traffic into a write and a new row version per call. An agent polling
+    // search would generate a steady stream of dead tuples in api_key for a
+    // timestamp that only needs minute-level resolution.
+    const stale = !key.lastUsedAt || Date.now() - key.lastUsedAt.getTime() > LAST_USED_WRITE_INTERVAL_MS;
+    if (stale) {
+      await prisma().apiKey.update({
+        where: { id: key.id },
+        data: { lastUsedAt: new Date() },
+      });
+    }
+    return { type: "api_key", apiKeyId: key.id, projectId: key.projectId };
   }
   const session = await auth.api.getSession({ headers: request.headers });
   if (session) {
@@ -49,7 +59,7 @@ async function apiKeyHashFor(token: string) {
   const prefix = token.slice(0, 10);
   const candidates = await prisma().apiKey.findMany({
     where: { keyPrefix: prefix, revokedAt: null },
-    select: { id: true, keyHash: true, projectId: true },
+    select: { id: true, keyHash: true, projectId: true, lastUsedAt: true },
   });
   for (const key of candidates) {
     if (verifyApiKey(token, key.keyHash)) return key;
@@ -58,18 +68,10 @@ async function apiKeyHashFor(token: string) {
 }
 
 /**
- * Resolves a project scope for a principal. API keys are scoped to zero or one
- * project; anything else is forbidden. Session users may access every project.
+ * Whether a principal may touch a project. API keys are scoped to zero or one
+ * project; an unscoped key is owner-level. Session users may access every
+ * project.
  */
-export function assertProjectAccess(principal: Principal, projectId: string): void {
-  if (principal.type === "api_key") {
-    if (principal.projectId !== null && principal.projectId !== projectId) {
-      throw forbidden("project_forbidden", "This API key cannot access the requested project");
-    }
-  }
-}
-
-/** API keys without a project scope can access every project (owner-level). */
 export function canAccessProject(principal: Principal, projectId: string): boolean {
   if (principal.type === "session") return true;
   return principal.projectId === null || principal.projectId === projectId;

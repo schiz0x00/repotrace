@@ -1,4 +1,4 @@
-import { errorBody, statusOf } from "@/lib/errors";
+import { badRequest, errorBody, notFound, statusOf } from "@/lib/errors";
 
 export type RouteHandler = (
   request: Request,
@@ -33,7 +33,9 @@ export async function jsonBody(request: Request): Promise<unknown> {
   try {
     return await request.json();
   } catch {
-    throw Object.assign(new Error("Request body must be valid JSON"), { status: 400 });
+    // Must be an AppError: a plain Error carrying a `.status` property is
+    // ignored by statusOf() and would surface as a 500.
+    throw badRequest("invalid_json", "Request body must be valid JSON");
   }
 }
 
@@ -42,6 +44,6 @@ export function getParam(
   name: string,
 ): string {
   const value = params[name];
-  if (!value) throw Object.assign(new Error(`Missing route parameter: ${name}`), { status: 404 });
+  if (!value) throw notFound("missing_route_param", `Missing route parameter: ${name}`);
   return value;
 }

@@ -59,6 +59,10 @@ const EnvSchema = z.object({
   JOB_RETRY_BACKOFF_MS: z.coerce.number().int().min(0).default(5000),
 
   MAX_FILE_SIZE_BYTES: z.coerce.number().int().min(1).default(1_000_000),
+
+  // Metric retention. The metric_event table is append-only, so without a
+  // window it grows without bound on a long-running instance.
+  METRIC_RETENTION_DAYS: z.coerce.number().int().min(0).default(30),
 });
 
 const parsed = EnvSchema.safeParse(process.env);

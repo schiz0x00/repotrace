@@ -15,14 +15,20 @@ const updateSchema = z.object({
     .object({ token: z.string().min(1), username: z.string().optional() })
     .nullable()
     .optional(),
+  // Every embedding override is nullable as well as optional, because `null`
+  // is how the dashboard says "clear this and fall back to the system
+  // default". With `.optional()` alone, `null` was rejected and the one control
+  // for removing an override answered 400 for every project. `undefined` still
+  // means "leave unchanged"; the two are genuinely different on the wire, and
+  // the service layer already distinguishes them.
   embedding: z
     .object({
-      provider: z.string().min(1).optional(),
-      apiUrl: z.string().optional(),
-      apiKey: z.string().optional(),
-      model: z.string().min(1).optional(),
-      dimensions: z.number().int().positive().max(8192).optional(),
-      batchSize: z.number().int().min(1).max(512).optional(),
+      provider: z.string().min(1).nullable().optional(),
+      apiUrl: z.string().nullable().optional(),
+      apiKey: z.string().nullable().optional(),
+      model: z.string().min(1).nullable().optional(),
+      dimensions: z.number().int().positive().max(8192).nullable().optional(),
+      batchSize: z.number().int().min(1).max(512).nullable().optional(),
     })
     .optional(),
 });

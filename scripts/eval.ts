@@ -2,38 +2,22 @@ import "dotenv/config";
 
 import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
-import { requireProject, searchProject } from "@/lib/search/search";
-import { buildContextBundle } from "@/lib/search/context";
+import { requireProject } from "@/lib/search/search";
+import {
+  aggregateResults,
+  DEFAULT_SEARCH_MODE,
+  evaluateQuestion,
+  parseEvalQuestion,
+  type Aggregate,
+  type EvalQuestion,
+  type EvalQuestionIssue,
+  type QuestionResult,
+} from "@/lib/eval/recall";
 
 const EVALS_DIR = "data/evals";
-const K_VALUES = [5, 10];
 
 const DEFAULT_LIMIT = 10;
 const DEFAULT_FLOOR = 0.5;
-
-interface EvalQuestion {
-  id: string;
-  projectSlug: string;
-  query: string;
-  mode?: "hybrid" | "lexical" | "semantic" | "symbol";
-  expectedFiles: string[];
-  expectedSymbols?: string[];
-  notes?: string;
-}
-
-interface QuestionResult {
-  id: string;
-  projectSlug: string;
-  query: string;
-  mode: string;
-  expectedFiles: string[];
-  expectedSymbols: string[];
-  recallFiles: Partial<Record<number, number>>;
-  recallSymbols: Partial<Record<number, number>>;
-  contextHitRate: number | null;
-  topFiles: string[];
-  error?: string;
-}
 
 interface CliArgs {
   project?: string;
@@ -58,117 +42,65 @@ function parseArgs(argv: string[]): CliArgs {
   return out;
 }
 
-async function loadQuestions(dir: string): Promise<EvalQuestion[]> {
-  const entries = await readdir(dir).catch(() => []);
+/**
+ * Reads every `*.json` under `dir` and returns the questions plus every problem
+ * found in them.
+ *
+ * The problems are returned rather than thrown and the problems are collected
+ * rather than raised at the first one: the caller reports all of them and
+ * refuses to score anything, so a fixture with a typo cannot be half-run. The
+ * two failures this replaced were both silent — an unrecognised `mode` ran as
+ * hybrid under a row labelled with the author's string, and a file with no
+ * `questions` key (or a misspelled `expectedFile`) loaded zero questions and
+ * looked like an empty directory.
+ */
+async function loadQuestions(dir: string): Promise<{ questions: EvalQuestion[]; issues: EvalQuestionIssue[] }> {
+  const entries = (await readdir(dir).catch(() => []))
+    .filter((name) => name.endsWith(".json"))
+    .sort();
   const questions: EvalQuestion[] = [];
+  const issues: EvalQuestionIssue[] = [];
+
   for (const name of entries) {
-    if (!name.endsWith(".json")) continue;
-    const parsed = JSON.parse(await readFile(join(dir, name), "utf8")) as unknown;
-    const list = Array.isArray(parsed)
-      ? parsed
-      : (parsed as { questions?: EvalQuestion[] }).questions ?? [];
-    questions.push(...(list as EvalQuestion[]));
-  }
-  return questions;
-}
-
-function normalizePath(p: string): string {
-  return p.replace(/^\.\//, "");
-}
-
-function recallAt(retrieved: string[], expected: string[], k: number): number {
-  if (expected.length === 0) return 1;
-  const top = new Set(retrieved.slice(0, k).map(normalizePath));
-  const hits = expected.filter((e) => top.has(normalizePath(e)));
-  return hits.length / expected.length;
-}
-
-function symbolHitAt(retrieved: Array<string | null>, expected: string[], k: number): number {
-  if (expected.length === 0) return 1;
-  const top = retrieved.slice(0, k).filter((s): s is string => !!s);
-  const hits = expected.filter((e) => top.some((s) => s === e || s.startsWith(`${e}.`) || e.startsWith(`${s}.`)));
-  return hits.length / expected.length;
-}
-
-function unique(values: string[]): string[] {
-  return [...new Set(values)];
-}
-
-async function evaluateQuestion(
-  q: EvalQuestion,
-  cliLimit: number,
-): Promise<QuestionResult> {
-  const result: QuestionResult = {
-    id: q.id,
-    projectSlug: q.projectSlug,
-    query: q.query,
-    mode: q.mode ?? "hybrid",
-    expectedFiles: q.expectedFiles,
-    expectedSymbols: q.expectedSymbols ?? [],
-    recallFiles: {},
-    recallSymbols: {},
-    contextHitRate: null,
-    topFiles: [],
-  };
-  try {
-    const project = await requireProject(q.projectSlug);
-    const search = await searchProject(project.id, q.query, { mode: q.mode, limit: cliLimit });
-    const paths = search.items.map((i) => i.path);
-    const symbols = search.items.map((i) => i.symbol);
-    result.topFiles = unique(paths).slice(0, 10);
-    for (const k of K_VALUES) {
-      result.recallFiles[k] = recallAt(paths, q.expectedFiles, k);
-      result.recallSymbols[k] = symbolHitAt(symbols, q.expectedSymbols ?? [], k);
+    const file = join(dir, name);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(await readFile(file, "utf8"));
+    } catch (err) {
+      issues.push({ path: file, message: `is not valid JSON: ${(err as Error).message}` });
+      continue;
     }
 
-    const bundle = await buildContextBundle(project.id, q.query, { limit: 8 });
-    const bundleFiles = unique([
-      ...bundle.symbols.map((s) => s.path),
-      ...bundle.docs.map((d) => d.path),
-      ...bundle.relatedSymbols.map((r) => r.path),
-      ...bundle.tests.map((t) => t.path),
-    ]);
-    if (q.expectedFiles.length > 0) {
-      const matched = q.expectedFiles.filter((f) => bundleFiles.some((p) => normalizePath(p) === normalizePath(f)));
-      result.contextHitRate = matched.length / q.expectedFiles.length;
+    let list: unknown[];
+    if (Array.isArray(parsed)) {
+      list = parsed;
+    } else if (typeof parsed === "object" && parsed !== null && Array.isArray((parsed as { questions?: unknown }).questions)) {
+      list = (parsed as { questions: unknown[] }).questions;
+    } else {
+      issues.push({
+        path: file,
+        message: 'must be a JSON array of questions, or an object with a "questions" array',
+      });
+      continue;
     }
-  } catch (err) {
-    result.error = (err as Error).message;
+
+    for (const [index, entry] of list.entries()) {
+      const result = parseEvalQuestion(entry, `${file} question ${index + 1}`);
+      if (result.ok) questions.push(result.question);
+      else issues.push(...result.issues);
+    }
   }
-  return result;
+
+  return { questions, issues };
 }
 
-interface Aggregate {
-  questions: number;
-  failed: number;
-  recallFilesAt5: number | null;
-  recallFilesAt10: number | null;
-  recallSymbolsAt5: number | null;
-  recallSymbolsAt10: number | null;
-  contextHitRate: number | null;
-}
-
-function mean(values: number[]): number {
-  return values.length ? values.reduce((a, b) => a + b, 0) / values.length : 0;
-}
-
-function aggregateResults(results: QuestionResult[]): Aggregate {
-  const ran = results.filter((r) => !r.error);
-  const completed = ran.filter((r) => Object.keys(r.recallFiles).length > 0);
-  const file5 = completed.map((r) => r.recallFiles[5]!).filter((v) => v !== undefined);
-  const file10 = completed.map((r) => r.recallFiles[10]!).filter((v) => v !== undefined);
-  const sym5 = completed.map((r) => r.recallSymbols[5]!).filter((v) => v !== undefined);
-  const sym10 = completed.map((r) => r.recallSymbols[10]!).filter((v) => v !== undefined);
-  const ctx = completed.map((r) => r.contextHitRate).filter((v) => v !== null) as number[];
-  return {
-    questions: results.length,
-    failed: results.filter((r) => r.error).length,
-    recallFilesAt5: file5.length ? mean(file5) : null,
-    recallFilesAt10: file10.length ? mean(file10) : null,
-    recallSymbolsAt5: sym5.length ? mean(sym5) : null,
-    recallSymbolsAt10: sym10.length ? mean(sym10) : null,
-    contextHitRate: ctx.length ? mean(ctx) : null,
-  };
+function reportIssues(issues: EvalQuestionIssue[], json: boolean): void {
+  const message = [
+    `${issues.length} problem(s) in the question files; nothing was scored:`,
+    ...issues.map((i) => `  ${i.path} ${i.message}`),
+  ].join("\n");
+  if (json) console.log(JSON.stringify({ error: message, issues }, null, 2));
+  else console.error(message);
 }
 
 function fmt(v: number | null | undefined, fallback = "  -"): string {
@@ -221,12 +153,25 @@ function printReport(results: QuestionResult[], agg: Aggregate, floor: number): 
       "",
     ].join(" "),
   );
-  console.log(`questions: ${agg.questions}  failed: ${agg.failed}  recall@10 floor: ${floor}`);
+  // The symbol columns average only the questions that stated expectedSymbols.
+  // Without this line a 1.000 there is indistinguishable from "nothing to score".
+  if (agg.symbolQuestions < agg.questions - agg.failed) {
+    console.log(
+      `symbol recall averages the ${agg.symbolQuestions} question(s) that state expectedSymbols; the rest report no symbol score.`,
+    );
+  }
+  console.log(
+    `questions: ${agg.questions}  failed: ${agg.failed}  symbol-scored: ${agg.symbolQuestions}  recall@10 floor: ${floor}`,
+  );
 }
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
-  const all = await loadQuestions(EVALS_DIR);
+  const { questions: all, issues } = await loadQuestions(EVALS_DIR);
+  if (issues.length > 0) {
+    reportIssues(issues, args.json);
+    process.exit(1);
+  }
   const questions = args.project
     ? all.filter((q) => q.projectSlug === args.project)
     : all;
@@ -239,7 +184,26 @@ async function main(): Promise<void> {
 
   const results: QuestionResult[] = [];
   for (const q of questions) {
-    results.push(await evaluateQuestion(q, args.limit));
+    // Resolve the project here so a missing one is recorded as a per-question
+    // failure — the run reports it and exits non-zero — rather than aborting.
+    const project = await requireProject(q.projectSlug as string).catch(() => null);
+    if (!project) {
+      results.push({
+        id: q.id,
+        query: q.query,
+        mode: q.mode ?? DEFAULT_SEARCH_MODE,
+        expectedFiles: q.expectedFiles,
+        expectedSymbols: q.expectedSymbols ?? [],
+        recallFiles: {},
+        recallSymbols: {},
+        contextHitRate: null,
+        topFiles: [],
+        error: `project "${q.projectSlug}" not found`,
+      });
+      continue;
+    }
+    // The CLI reports a context hit rate, so it opts into the slower bundle.
+    results.push(await evaluateQuestion(project.id, q, args.limit, true));
   }
   const agg = aggregateResults(results);
 

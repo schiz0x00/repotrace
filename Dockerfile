@@ -47,6 +47,14 @@ COPY --from=builder /app/prisma ./prisma
 COPY --from=builder /app/.env.example ./.env.example
 
 RUN useradd --create-home --uid 1001 nextjs && chown -R nextjs:nextjs /app
+# The workspace root must exist in the image AND be owned by the runtime user.
+# docker-compose bind-mounts the host's ./data over /app/data, and that host
+# directory belongs to whoever ran compose — not to uid 1001 — so the worker
+# could not create a clone directory and every index job failed with EACCES.
+# Workspaces are rebuildable scratch space, not host data, so they live in a
+# named volume; Docker seeds a fresh named volume from this directory, taking
+# its ownership with it.
+RUN mkdir -p /app/data/workspaces && chown -R nextjs:nextjs /app/data
 USER nextjs
 
 EXPOSE 3000

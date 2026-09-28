@@ -1,14 +1,23 @@
 name: repotrace
 
+# Infrastructure credentials. Override REDIS_PASSWORD / QDRANT_API_KEY /
+# POSTGRES_PASSWORD in your shell or .env before exposing any of this beyond
+# localhost — the defaults are here so `docker compose up` works out of the box,
+# not because they are safe. Compose interpolates these from the environment and
+# the project .env file, not from each service's `env_file`.
+
 services:
   postgres:
     image: postgres:17-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_USER: repotrace
-      POSTGRES_PASSWORD: repotrace
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-repotrace}
       POSTGRES_DB: repotrace
+    # Bound to loopback: the database is for this stack, not the network. An
+    # authenticated-but-published Postgres on 0.0.0.0 is a standing invitation.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -19,39 +28,99 @@ services:
 
   qdrant:
     image: qdrant/qdrant:v1.19.0
+    restart: unless-stopped
+    environment:
+      # Without this, Qdrant accepts anonymous reads *and writes*: anyone who can
+      # reach the port can read every indexed chunk and delete the collections.
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:-repotrace-qdrant}
     ports:
-      - "6333:6333"
-      - "6334:6334"
+      - "127.0.0.1:6333:6333"
+      - "127.0.0.1:6334:6334"
     volumes:
       - qdrantdata:/qdrant/storage
     healthcheck:
-      test: ["CMD-SHELL", "curl -fs http://localhost:6333/healthz || exit 1"]
+      # The API key is required, so an unauthenticated probe now correctly
+      # reports unhealthy until the key is supplied.
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fs -H 'api-key: ${QDRANT_API_KEY:-repotrace-qdrant}' http://localhost:6333/healthz || exit 1",
+        ]
       interval: 2s
       timeout: 5s
       retries: 30
 
   redis:
     image: redis:7-alpine
-    command: ["redis-server", "--appendonly", "yes"]
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --requirepass
+      - ${REDIS_PASSWORD:-repotrace-redis}
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redisdata:/data
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      test: ["CMD-SHELL", "redis-cli -a '${REDIS_PASSWORD:-repotrace-redis}' ping | grep -q PONG"]
       interval: 2s
       timeout: 5s
       retries: 30
+
+  # ── Prisma migrations ────────────────────────────────────────────────────
+  #
+  # Nothing in this file ever applied prisma/migrations. `docker compose up`
+  # against an empty pgdata volume therefore brought the whole stack up looking
+  # fine — the app's probe only ran `SELECT 1`, which an empty database answers
+  # happily — and every real request failed on a missing relation. The app and
+  # worker now gate on this service completing successfully, so an unmigrated
+  # database is a failed start rather than a healthy-looking one.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # Explicit: a migration that failed must not be retried in a loop behind
+    # the operator's back. It exits non-zero and the stack stays down.
+    restart: "no"
+    environment:
+      DATABASE_URL: postgresql://repotrace:${POSTGRES_PASSWORD:-repotrace}@postgres:5432/repotrace
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      # The runtime stage copies /app/prisma but NOT /app/prisma.config.ts, and
+      # Prisma 7 refuses to run any `migrate` command without that file: the
+      # datasource URL is only expressible there (it is rejected in
+      # schema.prisma, and `prisma migrate deploy` errors out with
+      # "The datasource.url property is required in your Prisma config file").
+      # Bind-mounting it is the workaround. The proper fix is one line in the
+      # Dockerfile — COPY --from=builder /app/prisma.config.ts ./prisma.config.ts
+      # — after which this mount can be deleted.
+      #
+      # If this path ever stops being a regular file, Docker mounts a directory
+      # there instead and `prisma migrate deploy` fails loudly. It cannot fail
+      # quietly and leave the database unmigrated.
+      - ./prisma.config.ts:/app/prisma.config.ts:ro
+    command: ["npx", "prisma", "migrate", "deploy"]
 
   app:
     build:
       context: .
       dockerfile: Dockerfile
+    restart: unless-stopped
     env_file: .env
     environment:
-      DATABASE_URL: postgresql://repotrace:repotrace@postgres:5432/repotrace
-      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgresql://repotrace:${POSTGRES_PASSWORD:-repotrace}@postgres:5432/repotrace
+      REDIS_URL: redis://:${REDIS_PASSWORD:-repotrace-redis}@redis:6379
       QDRANT_URL: http://qdrant:6333
+      QDRANT_API_KEY: ${QDRANT_API_KEY:-repotrace-qdrant}
+      # Must be set here, not inherited from .env: inside the container the app
+      # reaches itself on its own port, and this is what better-auth uses to
+      # build reset links and the MCP/webhook URLs.
+      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://localhost:3000}
+      WORKSPACE_DIR: /app/data/workspaces
     ports:
       - "3000:3000"
     depends_on:
@@ -61,19 +130,118 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     volumes:
       - ./data:/app/data
+      - workspaces:/app/data/workspaces
     command: ["npm", "run", "start"]
+    # Two checks, because the app's own probe cannot see the second one.
+    #
+    # 1. /api/v1/health — the public liveness endpoint; 503 when a dependency is
+    #    down. This is the part an orchestrator should act on.
+    # 2. Migration state, read from the migration ledger and checked against the
+    #    migrations that shipped in this image. `SELECT 1` succeeds against an
+    #    empty database, so "postgres is reachable" is not "the schema exists".
+    #    A container that skipped its migration step reported healthy until the
+    #    first query hit a missing relation.
+    #
+    #    Both halves matter, because "no unfinished migration" is not the same
+    #    claim as "this image's schema is in the database". A brand-new database
+    #    has no ledger at all (the query throws, which fails the probe) but a
+    #    database migrated up to last release has a perfectly clean one: a
+    #    migration added since then is simply absent, and nothing in the ledger
+    #    says so. So the probe also reads prisma/migrations/ out of the image
+    #    and fails on any migration that is not in the applied set. That is the
+    #    case the app container is otherwise blind to — it starts, probes fine,
+    #    and 500s on the first query against a table the new code expects.
+    #
+    #    It is deliberately one-sided: a migration applied but absent from this
+    #    image (a rollback to an older image) is not a failure, because the
+    #    older code cannot be missing a column that already exists.
+    #
+    # Uses node rather than curl: the runtime image has no curl. `pg` is
+    # available there as a production dependency (via @prisma/adapter-pg), so
+    # the probe needs nothing that is not already shipped.
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - |
+          const fail = (why) => { console.error("unhealthy: " + why); process.exit(1); };
+          // A connect failure surfaces as an AggregateError with an EMPTY
+          // message, which printed as "unhealthy: schema check failed: " and
+          // told an operator nothing. Unwrap it, and fall back to the per-cause
+          // list rather than the bare constructor name.
+          const why = (e) =>
+            (e && e.message) ||
+            (e && Array.isArray(e.errors) && e.errors.map((x) => x.message || String(x)).join("; ")) ||
+            String(e);
+          const MIGRATIONS_DIR = "/app/prisma/migrations";
+          (async () => {
+            let res;
+            try {
+              // PORT, not a literal: this service carries env_file: .env,
+              // which overrides the image's PORT, so an operator who set
+              // PORT=8080 had the probe aimed at a port nothing was listening
+              // on and a permanently "unhealthy" container.
+              const port = process.env.PORT || "3000";
+              res = await fetch(`http://127.0.0.1:${port}/api/v1/health`);
+            } catch (e) {
+              return fail("app not answering: " + why(e));
+            }
+            if (!res.ok) return fail("app reports /api/v1/health " + res.status);
+
+            const { Client } = require("pg");
+            const client = new Client({ connectionString: process.env.DATABASE_URL });
+            let unfinished, applied;
+            try {
+              await client.connect();
+              const q = await client.query(
+                'select migration_name, finished_at is null or rolled_back_at is not null as broken from "_prisma_migrations"'
+              );
+              unfinished = q.rows.filter((r) => r.broken).map((r) => r.migration_name);
+              applied = new Set(q.rows.filter((r) => !r.broken).map((r) => r.migration_name));
+            } catch (e) {
+              return fail("migration ledger unreadable: " + why(e));
+            } finally {
+              await client.end().catch(() => {});
+            }
+            if (unfinished.length) return fail("not finished: " + unfinished.join(", "));
+
+            let shipped;
+            try {
+              const fs = require("fs");
+              shipped = fs
+                .readdirSync(MIGRATIONS_DIR, { withFileTypes: true })
+                .filter((d) => d.isDirectory())
+                .filter((d) => fs.existsSync(MIGRATIONS_DIR + "/" + d.name + "/migration.sql"))
+                .map((d) => d.name);
+            } catch (e) {
+              return fail("cannot read " + MIGRATIONS_DIR + ": " + why(e));
+            }
+            const missing = shipped.filter((name) => !applied.has(name));
+            if (missing.length) return fail("not applied: " + missing.join(", "));
+            process.exit(0);
+          })();
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 40s
 
   worker:
     build:
       context: .
       dockerfile: Dockerfile
+    restart: unless-stopped
     env_file: .env
     environment:
-      DATABASE_URL: postgresql://repotrace:repotrace@postgres:5432/repotrace
-      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgresql://repotrace:${POSTGRES_PASSWORD:-repotrace}@postgres:5432/repotrace
+      REDIS_URL: redis://:${REDIS_PASSWORD:-repotrace-redis}@redis:6379
       QDRANT_URL: http://qdrant:6333
+      QDRANT_API_KEY: ${QDRANT_API_KEY:-repotrace-qdrant}
+      WORKSPACE_DIR: /app/data/workspaces
     depends_on:
       postgres:
         condition: service_healthy
@@ -81,11 +249,37 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      # The worker writes to the database as soon as it starts reconciling
+      # jobs, so it needs the same schema guarantee the app does.
+      migrate:
+        condition: service_completed_successfully
     volumes:
       - ./data:/app/data
+      - workspaces:/app/data/workspaces
     command: ["npm", "run", "worker"]
+    # The worker has no HTTP surface, so its liveness is "the queue is
+    # reachable". Redis dropping out from under a worker leaves it alive but
+    # permanently unable to take jobs, which is the failure that matters here.
+    # ioredis is the client the worker already uses.
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "const R=require('ioredis');const c=new R(process.env.REDIS_URL,{connectTimeout:5000});c.ping().then(()=>c.quit()).then(()=>process.exit(0)).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
 
 volumes:
+  # Repository clones. A named volume, not the host's ./data: the image runs as
+  # uid 1001 while ./data belongs to the host user, so the worker could not
+  # write into the bind mount and no project ever indexed. Docker seeds this
+  # volume from /app/data/workspaces in the image, which is owned correctly.
+  workspaces:
   pgdata:
   qdrantdata:
   redisdata:

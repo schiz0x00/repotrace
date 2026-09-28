@@ -12,7 +12,71 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # The unit suite imports modules that validate configuration at import
+      # time, so it needs the same env the app expects. Values here are
+      # throwaway test values, never real credentials.
+      - name: Test environment
+        run: cp .env.example .env
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      # ── Prisma schema ↔ committed client ────────────────────────────────────
+      # prisma/schema.prisma writes the client to src/generated/prisma, and that
+      # output is committed to the repository. The Dockerfile builds the app and
+      # worker straight from source with no `prisma generate` step and
+      # package.json has no postinstall hook, so whatever is committed is exactly
+      # what ships. Nothing in lint/typecheck/tests notices a stale client: a
+      # client missing a column still typechecks against the older schema, and
+      # the mismatch only appears at runtime as a PrismaClientValidationError
+      # against a column that is really there in Postgres.
+      #
+      # `prisma validate` is the cheap first gate — it parses the schema and the
+      # generator block and needs no database, unlike anything under `prisma
+      # migrate`, which would connect to a live Postgres. But it never looks at
+      # the generated output, so it cannot by itself detect a stale client. The
+      # generate-and-diff below is what closes that gap; it also touches no
+      # database, only the local filesystem.
+      #
+      # `prisma generate` is run against the checked-in schema and output path
+      # rather than a rewritten copy, so the comparison is against the real
+      # committed file set with no path rewriting to undo.
+      - name: Prisma schema is valid
+        run: npx prisma validate
+
+      - name: Prisma client matches schema
+        run: |
+          npm run db:generate
+          if ! git diff --exit-code -- src/generated; then
+            echo "::error::src/generated is out of date with prisma/schema.prisma."
+            echo "Run 'npm run db:generate' and commit the result."
+            git diff --stat -- src/generated
+            exit 1
+          fi
+
   build:
+    needs: check
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -51,3 +115,119 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # ── Deployment smoke test ─────────────────────────────────────────────────
+  #
+  # `docker build` returning zero proves the image compiles. It does not prove
+  # the image runs: a file missing from the runtime stage, an entrypoint that
+  # dies thirty seconds after start, a migration that never applies and a
+  # healthcheck that never turns healthy are all invisible to a build, and all
+  # of them reached a deployment before. Nothing in this repository had ever
+  # started the thing it was shipping.
+  #
+  # This job starts the real stack from `docker compose up` — the same file an
+  # operator runs, with the same build, the same migration service and the same
+  # container healthcheck — against empty volumes, which is the case that used
+  # to come up looking fine and fail on the first query. Three assertions, each
+  # a failure the previous one cannot see:
+  #
+  #   1. /api/v1/health answers 200. It answers 503 when postgres, qdrant or
+  #      redis is down, so this is a real dependency check.
+  #   2. Every migration directory in this checkout is in the database's ledger,
+  #      and a real table exists. `SELECT 1` — all the app's own probe does —
+  #      cannot see any of that.
+  #   3. The app and worker containers turn *healthy* under the healthchecks in
+  #      docker-compose.yml. The app's is not just the route above: it also
+  #      reads the migration ledger and compares it to the migrations in the
+  #      image, so this also proves the probe itself does not hang or crash.
+  smoke:
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # app and worker declare `env_file: .env`, so compose refuses to start
+      # without it. These are the throwaway values from .env.example — never
+      # real credentials, and the stack is torn down at the end of the job.
+      - name: Test environment
+        run: cp .env.example .env
+
+      # app, worker and migrate share one build config, so this builds the image
+      # once and serves it to all three (compose names the built image per
+      # service, but the build itself is layer-cached against the same context).
+      - name: Start the stack
+        run: docker compose up -d --build
+
+      - name: Wait for the app to report healthy
+        run: |
+          for attempt in $(seq 1 60); do
+            if curl -fsS --max-time 5 http://127.0.0.1:3000/api/v1/health > /tmp/health.json; then
+              cat /tmp/health.json
+              echo
+              exit 0
+            fi
+            echo "attempt $attempt: /api/v1/health not healthy yet"
+            sleep 5
+          done
+          echo "::error::the app never answered /api/v1/health with 200"
+          exit 1
+
+      - name: Every migration that shipped is applied, by name
+        run: |
+          # Compared by NAME, not by count. Counting is not a check: five
+          # renamed migrations, or one applied twice and another skipped, leave
+          # the total unchanged and pass a gate that looks like it verifies the
+          # schema matches the migrations.
+          find prisma/migrations -mindepth 2 -maxdepth 2 -name migration.sql \
+            -exec dirname {} \; | xargs -n1 basename | sort > /tmp/expected.txt
+          docker compose exec -T postgres \
+            psql -U repotrace -d repotrace -tAc \
+            'select migration_name from "_prisma_migrations" where finished_at is not null and rolled_back_at is null' \
+            | sort > /tmp/applied.txt
+          missing=$(comm -23 /tmp/expected.txt /tmp/applied.txt)
+          if [ -n "$missing" ]; then
+            echo "::error::migrations present in the image but not applied:"
+            echo "$missing"
+            docker compose exec -T postgres psql -U repotrace -d repotrace -c \
+              'select migration_name, finished_at, rolled_back_at from "_prisma_migrations" order by migration_name'
+            exit 1
+          fi
+          echo "all $(wc -l < /tmp/expected.txt) migrations applied by name"
+          # `SELECT 1` — which is all the app's own probe does — succeeds against
+          # an empty database. A real table does not, so this is the assertion
+          # that the schema is actually there.
+          docker compose exec -T postgres psql -U repotrace -d repotrace -tAc \
+            'select count(*) from "commit"'
+
+      # After the ledger assertion, not before: an unmigrated database leaves
+      # the app's HTTP route perfectly healthy (it only runs SELECT 1) and
+      # fails this step, which says exactly what is wrong. Waiting on the
+      # container healthcheck first would instead time out for two minutes on
+      # a message that does not name the cause.
+      - name: Wait for the container healthchecks
+        run: |
+          for service in app worker; do
+            cid=$(docker compose ps -q "$service")
+            for attempt in $(seq 1 30); do
+              status=$(docker inspect --format '{{.State.Health.Status}}' "$cid" 2>/dev/null || echo "no healthcheck")
+              if [ "$status" = healthy ]; then
+                echo "$service: healthy"
+                break
+              fi
+              if [ "$attempt" = 30 ]; then
+                echo "::error::$service healthcheck settled on '$status'"
+                exit 1
+              fi
+              sleep 5
+            done
+          done
+
+      - name: Logs
+        if: failure()
+        run: docker compose logs --no-color --tail 200
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v --remove-orphans

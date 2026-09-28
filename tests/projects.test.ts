@@ -52,6 +52,28 @@ describe("normalizeRepoUrl", () => {
   it("rejects unparseable input", () => {
     expect(() => normalizeRepoUrl("not a url")).toThrowError(/Repository URL/);
   });
+
+  // The server clones whatever URL it is handed, so a cloud metadata address
+  // would turn "index my repo" into a request that returns instance
+  // credentials. Loopback and RFC1918 stay allowed: a self-hosted git server
+  // on a LAN or inside a compose network is a legitimate target.
+  it("refuses link-local and metadata addresses", () => {
+    for (const url of [
+      "http://169.254.169.254/latest/meta-data/",
+      "https://169.254.169.254/",
+      "http://metadata.google.internal/computeMetadata/v1/",
+      "http://localhost:3000/repo.git",
+      "http://[fe80::1]/repo.git",
+    ]) {
+      expect(() => normalizeRepoUrl(url), url).toThrowError(/link-local|metadata/);
+    }
+  });
+
+  it("still allows private-network git servers", () => {
+    for (const url of ["http://10.0.0.5:8080/git/repo.git", "http://192.168.1.10/repo.git"]) {
+      expect(normalizeRepoUrl(url)).toBe(url);
+    }
+  });
 });
 
 describe("createProject validation", () => {
@@ -62,6 +84,24 @@ describe("createProject validation", () => {
     } catch (err) {
       expect(err).toBeInstanceOf(AppError);
       expect((err as AppError).code).toBe("invalid_repo_url");
+      expect((err as AppError).status).toBe(400);
+    }
+  });
+
+  // The git layer re-validates the ref and is what prevents the RCE, but a bad
+  // branch accepted here is only discovered when a sync runs, so the operator
+  // gets a job failure rather than a rejected request.
+  it("rejects a branch git would parse as an option, before touching the database", async () => {
+    try {
+      await createProject({
+        name: "injection",
+        repoUrl: "https://github.com/owner/repo",
+        defaultBranch: "--upload-pack=touch /tmp/pwned",
+      });
+      expect.unreachable("createProject should have thrown");
+    } catch (err) {
+      expect(err).toBeInstanceOf(AppError);
+      expect((err as AppError).code).toBe("invalid_branch");
       expect((err as AppError).status).toBe(400);
     }
   });

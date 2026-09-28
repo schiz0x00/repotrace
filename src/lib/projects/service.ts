@@ -1,4 +1,5 @@
 import { badRequest, conflict, notFound } from "@/lib/errors";
+import { redactUrl, isSafeGitRef } from "@/lib/git/git";
 import { encryptRepoCredentials } from "@/lib/git/workspace";
 import { enqueueJob } from "@/lib/jobs/queue";
 import { prisma } from "@/lib/prisma";
@@ -38,9 +39,41 @@ export function slugify(name: string): string {
   );
 }
 
+/**
+ * Link-local address space, which includes the cloud instance metadata
+ * endpoint (169.254.169.254 on AWS/GCP/Azure). The server clones whatever URL
+ * it is given, so a metadata URL would turn "index my repo" into a request
+ * that returns instance credentials.
+ *
+ * Loopback and RFC1918 addresses are deliberately *not* blocked: a
+ * self-hosted git server on a LAN or on 127.0.0.1 inside a compose network is
+ * a legitimate target for this product.
+ */
+function isLinkLocalHost(hostname: string): boolean {
+  const host = hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  if (host === "localhost" || host.endsWith(".localhost")) return true;
+  if (/^169\.254\./.test(host)) return true;
+  if (/^fe[89ab][0-9a-f]:/i.test(host)) return true;
+  // AWS also exposes metadata at the reserved 169.254.169.253 DNS name.
+  return host === "metadata.google.internal" || host === "metadata.goog";
+}
+
 export function normalizeRepoUrl(url: string): string {
   const trimmed = url.trim();
   if (/^https?:\/\//i.test(trimmed) || /^git@/i.test(trimmed) || /^ssh:\/\//i.test(trimmed) || /^file:\/\//i.test(trimmed)) {
+    if (/^https?:\/\//i.test(trimmed)) {
+      try {
+        if (isLinkLocalHost(new URL(trimmed).hostname)) {
+          throw badRequest(
+            "invalid_repo_url",
+            "Repository URL points at a link-local or metadata address, which is refused",
+          );
+        }
+      } catch (err) {
+        if (err && typeof err === "object" && "status" in err) throw err;
+        throw badRequest("invalid_repo_url", "Repository URL is not a valid URL");
+      }
+    }
     return trimmed;
   }
   // github.com/owner/repo shorthand
@@ -61,40 +94,84 @@ async function uniqueSlug(name: string): Promise<string> {
   throw conflict("slug_exhausted", "Could not generate a unique project slug");
 }
 
+/**
+ * Validates a branch name at the API boundary.
+ *
+ * `isSafeGitRef` is enforced again in the git layer — that is what stops the
+ * argument-injection RCE — but a bad branch stored here is only discovered when
+ * a sync runs, so the operator sees a job failure instead of a rejected input.
+ */
+function normalizeBranch(branch: string | undefined): string {
+  const value = (branch ?? "main").trim() || "main";
+  if (!isSafeGitRef(value)) {
+    throw badRequest(
+      "invalid_branch",
+      "Branch must be a plain git ref name (no leading \"-\", whitespace, or \"..\")",
+    );
+  }
+  return value;
+}
+
 export async function createProject(input: ProjectInput) {
   const db = prisma();
   const provider = input.provider ?? guessProvider(input.repoUrl);
   const url = normalizeRepoUrl(input.repoUrl);
-  const slug = await uniqueSlug(input.name);
+  const branch = normalizeBranch(input.defaultBranch);
   const credentialsEncrypted = input.credentials?.token
     ? encryptRepoCredentials({ token: input.credentials.token, username: input.credentials.username })
     : null;
 
-  const project = await db.project.create({
-    data: {
-      name: input.name.trim(),
-      slug,
-      description: input.description ?? null,
-      provider,
-      repoUrl: url,
-      defaultBranch: input.defaultBranch || "main",
-      embeddingProvider: input.embedding?.provider,
-      embeddingApiUrl: input.embedding?.apiUrl,
-      embeddingModel: input.embedding?.model,
-      embeddingDimensions: input.embedding?.dimensions,
-      embeddingBatchSize: input.embedding?.batchSize,
-      repository: {
-        create: {
+  // uniqueSlug reads then writes, so two projects created in the same
+  // millisecond with the same name can both compute the same free slug and the
+  // loser's INSERT fails on the unique constraint. Retry rather than surfacing
+  // a 500 for what is a routine concurrency case.
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const slug = await uniqueSlug(input.name);
+    try {
+      return await db.project.create({
+        data: {
+          name: input.name.trim(),
+          slug,
+          description: input.description ?? null,
           provider,
-          url,
-          branch: input.defaultBranch || "main",
-          credentialsEncrypted,
+          repoUrl: url,
+          defaultBranch: branch,
+          embeddingProvider: input.embedding?.provider,
+          embeddingApiUrl: input.embedding?.apiUrl,
+          // Accepted, answered 201, and silently dropped: only `updateProject`
+          // ever wrote this column, so a per-project embedding key supplied at
+          // creation time was discarded and the project fell back to the
+          // system default with nothing in the response to say so.
+          embeddingApiKeyEnc: input.embedding?.apiKey
+            ? encryptRepoCredentials({ token: input.embedding.apiKey })
+            : null,
+          embeddingModel: input.embedding?.model,
+          embeddingDimensions: input.embedding?.dimensions,
+          embeddingBatchSize: input.embedding?.batchSize,
+          repository: {
+            create: {
+              provider,
+              url,
+              branch,
+              credentialsEncrypted,
+            },
+          },
         },
-      },
-    },
-    include: { repository: true },
-  });
-  return project;
+        include: { repository: true },
+      });
+    } catch (err) {
+      if (!isUniqueViolation(err) || attempt === 4) throw err;
+    }
+  }
+  throw conflict("slug_exhausted", "Could not generate a unique project slug");
+}
+
+function isUniqueViolation(err: unknown): boolean {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    (err as { code?: unknown }).code === "P2002"
+  );
 }
 
 function guessProvider(url: string): ProjectProvider {
@@ -110,13 +187,20 @@ export interface ProjectUpdate {
   defaultBranch?: string;
   repoUrl?: string;
   credentials?: { token?: string; username?: string } | null;
+  /**
+   * Every override is nullable as well as optional: `undefined` means "leave
+   * unchanged" and `null` means "clear it and fall back to the system default".
+   * The dashboard needs that distinction, because a stored key or model is
+   * otherwise unreachable - blanking the field is indistinguishable, on the
+   * wire, from leaving it alone.
+   */
   embedding?: {
-    provider?: string;
-    apiUrl?: string;
-    apiKey?: string;
-    model?: string;
-    dimensions?: number;
-    batchSize?: number;
+    provider?: string | null;
+    apiUrl?: string | null;
+    apiKey?: string | null;
+    model?: string | null;
+    dimensions?: number | null;
+    batchSize?: number | null;
   };
 }
 
@@ -128,10 +212,11 @@ export async function updateProject(projectId: string, input: ProjectUpdate) {
   });
   if (!project) throw notFound("project_not_found", "Project not found");
 
+  const branch = input.defaultBranch !== undefined ? normalizeBranch(input.defaultBranch) : undefined;
   const data: Record<string, unknown> = {
     ...(input.name !== undefined ? { name: input.name.trim() } : {}),
     ...(input.description !== undefined ? { description: input.description } : {}),
-    ...(input.defaultBranch !== undefined ? { defaultBranch: input.defaultBranch } : {}),
+    ...(branch !== undefined ? { defaultBranch: branch } : {}),
     ...(input.repoUrl !== undefined ? { repoUrl: normalizeRepoUrl(input.repoUrl) } : {}),
   };
   const embedding = input.embedding;
@@ -144,6 +229,20 @@ export async function updateProject(projectId: string, input: ProjectUpdate) {
     if (embedding.model !== undefined) data.embeddingModel = embedding.model;
     if (embedding.dimensions !== undefined) data.embeddingDimensions = embedding.dimensions;
     if (embedding.batchSize !== undefined) data.embeddingBatchSize = embedding.batchSize;
+
+    // Changing the model, endpoint or dimensionality invalidates every vector
+    // already in the collection — they are not merely stale, they cannot be
+    // compared against vectors from a different model at all. Bumping the
+    // version makes search filter to the new version only, so a half-reembedded
+    // index never fuses two embedding spaces into one ranking. The project
+    // reports `reembedRequired` until a reembed job refills it.
+    const identityChanged =
+      (embedding.model !== undefined && embedding.model !== project.embeddingModel) ||
+      (embedding.dimensions !== undefined && embedding.dimensions !== project.embeddingDimensions) ||
+      (embedding.apiUrl !== undefined && embedding.apiUrl !== project.embeddingApiUrl);
+    if (identityChanged) {
+      data.embeddingVersion = (project.embeddingVersion ?? 1) + 1;
+    }
   }
 
   const updated = await db.project.update({
@@ -154,7 +253,7 @@ export async function updateProject(projectId: string, input: ProjectUpdate) {
 
   // Repository mirror (branch / url / credentials).
   const repoData: Record<string, unknown> = {};
-  if (input.defaultBranch !== undefined) repoData.branch = input.defaultBranch;
+  if (input.defaultBranch !== undefined) repoData.branch = branch;
   if (input.repoUrl !== undefined) repoData.url = normalizeRepoUrl(input.repoUrl);
   if (input.credentials !== undefined) {
     repoData.credentialsEncrypted = input.credentials?.token
@@ -187,18 +286,42 @@ export async function listProjects(includeStats = false) {
   if (!includeStats) {
     return projects.map((p) => projectToDto(p));
   }
-  const stats = await Promise.all(
-    projects.map(async (p) => {
-      const [files, symbols, chunks, jobs] = await Promise.all([
-        db.file.count({ where: { projectId: p.id, status: "indexed" } }),
-        db.symbol.count({ where: { projectId: p.id } }),
-        db.chunk.count({ where: { projectId: p.id } }),
-        db.job.count({ where: { projectId: p.id, status: { in: ["queued", "running"] } } }),
-      ]);
-      return { projectId: p.id, files, symbols, chunks, activeJobs: jobs };
+  // Four grouped queries rather than four counts per project. The dashboard's
+  // project list asks for this on every render, so with N projects the old
+  // shape issued 4N round trips before the page could finish.
+  const ids = projects.map((p) => p.id);
+  const toMap = (rows: Array<{ projectId: string | null; _count: { _all: number } }>) =>
+    new Map(rows.filter((r) => r.projectId !== null).map((r) => [r.projectId as string, r._count._all]));
+
+  if (ids.length === 0) return [];
+  const [fileCounts, symbolCounts, chunkCounts, jobCounts] = await Promise.all([
+    db.file.groupBy({
+      by: ["projectId"],
+      where: { projectId: { in: ids }, status: "indexed" },
+      _count: { _all: true },
     }),
-  );
-  return projects.map((p, i) => ({ ...projectToDto(p), stats: stats[i] }));
+    db.symbol.groupBy({ by: ["projectId"], where: { projectId: { in: ids } }, _count: { _all: true } }),
+    db.chunk.groupBy({ by: ["projectId"], where: { projectId: { in: ids } }, _count: { _all: true } }),
+    db.job.groupBy({
+      by: ["projectId"],
+      where: { projectId: { in: ids }, status: { in: ["queued", "running"] } },
+      _count: { _all: true },
+    }),
+  ]);
+  const files = toMap(fileCounts);
+  const symbols = toMap(symbolCounts);
+  const chunks = toMap(chunkCounts);
+  const jobs = toMap(jobCounts);
+
+  return projects.map((p) => ({
+    ...projectToDto(p),
+    stats: {
+      files: files.get(p.id) ?? 0,
+      symbols: symbols.get(p.id) ?? 0,
+      chunks: chunks.get(p.id) ?? 0,
+      activeJobs: jobs.get(p.id) ?? 0,
+    },
+  }));
 }
 
 export async function requireProjectByIdOrSlug(idOrSlug: string) {
@@ -217,13 +340,21 @@ export function projectToDto(project: Awaited<ReturnType<typeof requireProjectBy
     slug: project.slug,
     description: project.description,
     provider: project.provider,
-    repoUrl: project.repoUrl,
+    // Operators do paste `https://user:token@host/...`. That value is stored
+    // as-is and would otherwise be handed back by every project read; strip
+    // the userinfo the same way the git layer does before it reaches a
+    // response or the dashboard.
+    repoUrl: redactUrl(project.repoUrl),
     defaultBranch: project.defaultBranch,
     status: project.status,
     createdAt: project.createdAt,
     updatedAt: project.updatedAt,
     embedding: {
       provider: project.embeddingProvider,
+      // The endpoint URL, not the key. The key is stored as
+      // `embeddingApiKeyEnc` and is never returned; the dashboard's settings
+      // form needs the URL to show what the project is currently pointed at.
+      apiUrl: project.embeddingApiUrl,
       model: project.embeddingModel,
       dimensions: project.embeddingDimensions,
       batchSize: project.embeddingBatchSize,
